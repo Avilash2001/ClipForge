@@ -25,7 +25,7 @@ DEFAULT_INPUT_DIR = INPUT_DIR
 DEFAULT_OUTPUT_DIR = OUTPUT_DIR
 OLLAMA_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0"
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi"}
 
 HYPE_WORDS = {
@@ -580,16 +580,17 @@ def _rank_batch(candidates: list[Candidate], model: str, game_profile: str,
         f"You are a careful gaming-video editor reviewing {game_profile} footage. "
         "Each attached image is a 3x3 contact sheet for one candidate; its nine frames are in chronological order. "
         "Use the visual sequence AND the speech context together. Do not infer a kill, win, clutch or funny event "
-        "unless visible frames or transcript support it. Judge whether the clip has a coherent mini-story: "
-        "hook/setup, action/escalation, payoff, reaction/aftermath. Pure gameplay without speech can still be good, "
-        "but score narrative coherence honestly. A clip that starts after the action or ends before its payoff gets a lower story score. "
+        "unless visible frames or transcript support it. Judge whether the clip is a COMPLETE, standalone mini-story: "
+        "a viewer who has not watched the VOD must be able to understand the hook/setup, action/escalation, payoff, and brief reaction/aftermath. "
+        "Pure gameplay without speech can still be good, but score narrative coherence honestly. A clip that starts after the action, starts in a loading/buy/menu state, "
+        "or ends before the payoff/reaction is not publish-ready and must receive story_score <= 0.30. Do not promote an unfinished fragment merely because it is loud or high-motion. "
         "Reject stream starting soon screens, countdowns, menus, lobbies, character selection, loading screens, settings, "
         "long static scenes and ordinary scoreboards. Prefer active combat, close calls, objective changes, funny failures, "
         "impressive plays, victory/defeat, or a notable reaction. Do not invent events. "
         "Return ONLY JSON matching the provided schema, with a result for every index. Scores are 0..1. "
         "screen_type must be active_gameplay, menu_lobby, starting_screen, loading_screen, scoreboard, cutscene, or other. "
         "Rejected screen types must have score and story_score <= 0.05. Use factual reasons. social_title must be short and honest; "
-        "social_caption one sentence; hashtags 3-5 items without #. Candidate details: " + json.dumps(rows, ensure_ascii=False)
+        "social_caption must be a ready-to-post, engaging 1-2 sentence description with a natural call to react; hashtags 3-5 items without #. Candidate details: " + json.dumps(rows, ensure_ascii=False)
     )
     schema = {
         "type": "object",
@@ -722,12 +723,20 @@ def ollama_rank(candidates: list[Candidate], model: str,
 
 
 def choose_top(candidates: list[Candidate], count: int) -> list[Candidate]:
+    """Pick distinct, standalone stories rather than adjacent fragments of one event."""
     ranked = sorted(candidates, key=lambda c: c.final_score, reverse=True)
     chosen: list[Candidate] = []
     for candidate in ranked:
         if candidate.screen_type in {"menu_lobby", "starting_screen", "loading_screen", "scoreboard"}:
             continue
-        if all(candidate.end <= old.start or candidate.start >= old.end for old in chosen):
+        # Windows may not overlap yet still be two cuts from the same round/event.
+        # Keep the best complete arc and make the next pick meaningfully independent.
+        story_gap = max(10.0, (candidate.end - candidate.start) * 0.40)
+        independent = all(
+            candidate.end + story_gap <= old.start or candidate.start >= old.end + story_gap
+            for old in chosen
+        )
+        if independent:
             chosen.append(candidate)
         if len(chosen) >= count:
             break
@@ -848,6 +857,10 @@ def render_vertical(video: Path, candidate: Candidate, output: Path, use_nvenc: 
         )
     if ass_path and ass_path.exists():
         video_filter = video_filter.replace("[v]", f",ass=filename='{_ffmpeg_filter_path(ass_path)}'[v]")
+    # A short visual and audio ease prevents a jarring hard cut even when the
+    # source event begins or ends at an energetic moment.
+    duration = max(0.1, candidate.end - candidate.start)
+    video_filter = video_filter.replace("[v]", f",fade=t=in:st=0:d=0.18,fade=t=out:st={max(0, duration - 0.22):.3f}:d=0.22[v]")
     common = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-ss", str(candidate.start), "-i", str(video),
@@ -856,7 +869,9 @@ def render_vertical(video: Path, candidate: Candidate, output: Path, use_nvenc: 
         "-movflags", "+faststart", "-pix_fmt", "yuv420p",
     ]
     if normalize_audio:
-        common.extend(["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"])
+        common.extend(["-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:st=0:d=0.12,afade=t=out:st={max(0, duration - 0.18):.3f}:d=0.18"])
+    else:
+        common.extend(["-af", f"afade=t=in:st=0:d=0.12,afade=t=out:st={max(0, duration - 0.18):.3f}:d=0.18"])
     if use_nvenc:
         cmd = common + ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "21", str(output)]
         try:
@@ -884,8 +899,8 @@ def create_thumbnail(video: Path, candidate: Candidate, output: Path) -> bool:
     return result.returncode == 0 and output.exists()
 
 
-def process_job(source: str, output_root: Path, input_dir: Path, *, count: int = 10,
-                clip_length: int = 35, stride: int = 15, whisper_model: str = "small",
+def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optional[int] = 10,
+                clip_length: Optional[int] = 35, stride: Optional[int] = 15, whisper_model: str = "small",
                 whisper_device: str = "cpu", ollama_model: str = DEFAULT_OLLAMA_MODEL,
                 use_ollama: bool = True, use_nvenc: bool = True,
                 game_profile: str = "Auto / mixed games",
@@ -898,7 +913,8 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: int =
                 log: Optional[LogCallback] = None,
                 cancel_event: Optional[threading.Event] = None) -> Path:
     check_tools()
-    if count < 1 or clip_length < 10 or stride < 5:
+    if ((count is not None and count < 1) or (clip_length is not None and clip_length < 10)
+            or (stride is not None and stride < 5)):
         raise ValueError("Clip count must be >=1, duration >=10 sec and scan interval >=5 sec.")
     _check_cancel(cancel_event)
     input_dir.mkdir(parents=True, exist_ok=True)
@@ -918,6 +934,14 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: int =
     _emit(progress, "Inspecting video", 0, 10, "Reading video metadata...")
     duration = duration_seconds(video)
     _log(log, f"Duration: {duration/60:.1f} minutes")
+    auto_mode = count is None or clip_length is None or stride is None
+    # Longer windows with a dense scan give visual AI enough room to retain
+    # setup, escalation and payoff instead of selecting a single loud moment.
+    clip_length = clip_length or (45 if duration >= 90 else max(20, int(duration * 0.6)))
+    stride = stride or max(5, min(10, clip_length // 5))
+    count = count or max(3, min(10, int(round(duration / 150))))
+    if auto_mode:
+        _log(log, f"Story Auto chose {count} clips × {clip_length}s with a {stride}s scan interval.")
     job_name = re.sub(r"[^A-Za-z0-9_-]+", "_", video.stem)[:70].strip("_") or "gaming_video"
     job_dir = output_root / job_name
     suffix = 2
@@ -1091,6 +1115,7 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: int =
             "social_caption": candidate.social_caption,
             "hashtags": candidate.hashtags or [],
             "captions_burned": bool(burn_ass),
+            "posted": False,
         }
         manifest.append(manifest_row)
         (job_dir / f"{name}.metadata.json").write_text(
@@ -1107,6 +1132,10 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: int =
         "transcript_quality": quality,
         "transcript_usable": transcript_usable,
         "game_profile": game_profile,
+        "story_auto": auto_mode,
+        "clip_count": count,
+        "clip_length": clip_length,
+        "scan_interval": stride,
         "render_layout": render_layout,
         "burn_captions": burn_captions,
         "normalize_audio": normalize_audio,

@@ -15,11 +15,12 @@ ClipForge is a cross-platform Python desktop app for Windows, macOS and Linux. I
 - Transcript-quality checks that reject punctuation-only output, plus a Medium-model retry and stereo left/right channel fallback when speech is missing from a mono downmix.
 - Visual activity analysis from sampled frames.
 - Multimodal candidate review: Ollama receives chronological 3×3 frame contact sheets plus transcript context before/during/after each candidate.
-- Story-aware scoring for setup, escalation, payoff and reaction; explicit rejection of stream starting screens, menus, lobbies, loading screens and scoreboards.
+- Story Auto mode: adaptive clip count, longer story windows and dense scanning to favor standalone setup → escalation → payoff → reaction arcs; nearby fragments of the same event are de-duplicated.
 - Non-overlapping candidate selection.
 - 9:16 output with either full-gameplay fit / blurred background or fill / center crop.
 - Optional word-timed karaoke-style ASS captions (burned in when the local FFmpeg build has libass) and SRT/ASS sidecars.
-- Audio loudness normalisation, thumbnails, and per-clip social title/caption/hashtag suggestions from the local vision model.
+- Audio loudness normalisation with soft in/out transitions, thumbnails, and per-clip ready-to-post social title/caption/hashtag suggestions from the local vision model.
+- In-app Review & Publish gallery with visual previews, one-click playback/copy-post, and a persistent Posted checkbox per clip.
 - Live progress, ETA, logs and cancellation in the GUI.
 - FFmpeg child processes are isolated from terminal close/Ctrl+C events; the GUI warns before closing during an active job.
 - Local `input/`, `output/` and `logs/` runtime directories are excluded from Git.
@@ -153,7 +154,7 @@ For Fedora, Arch or other distributions, install equivalent packages for Python 
 1. Ensure Ollama is running and the selected vision model is present (`ollama list`).
 2. Select either a YouTube URL or a local video file. For your own VODs, local input is the most reliable route.
 3. If downloading from YouTube, select the browser in which you are signed in. Fully exit the browser before starting if yt-dlp reports a cookie database lock. Browser cookies are sensitive credentials; never export/share/commit them.
-4. Set the game profile, clip count, duration and scan interval.
+4. Leave clip count, duration and scan interval on **Auto** for the best chance of coherent standalone stories. Auto adapts the number of clips, uses a longer event window, and scans more densely. Choose manual values only when you need a strict export target.
 5. Set speech language to **Mixed (English + Bengali + Hindi)** for code-switched voice chat.
 6. Keep local Ollama visual AI enabled. Use `Fit + blurred background` to preserve the full HUD; use `Fill (center crop)` only when cropping game edges is acceptable.
 7. Leave **Burn in animated word-highlight captions** enabled if you want captions. Only validated speech is used. If FFmpeg lacks libass, ClipForge keeps sidecar caption files instead.
@@ -174,7 +175,7 @@ transcript.json
 clips.json
 ```
 
-`clips.json` includes timestamps, scores, screen classification, story explanation, generated social copy and caption/render status. Review the actual clips before publication.
+`clips.json` includes timestamps, scores, screen classification, story explanation, generated social copy, caption/render status and the persistent `posted` flag. Use **Review clips** in the app to preview thumbnails, play each export, copy the post text, and mark it posted. Review the actual clips before publication.
 
 ## Command line (optional)
 

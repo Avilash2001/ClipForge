@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.4.0
+
+- Added Story Auto for adaptive clip count, longer story windows and denser scanning.
+- Tightened visual-AI criteria to favor complete standalone arcs and reject unfinished action fragments.
+- De-duplicate nearby cuts from the same event and add soft audio/video transitions.
+- Added the in-app Review & Publish gallery with thumbnail previews, play/copy-post actions and persistent Posted tracking.
+
 ## 1.3.2
 
 - Fix Windows setup detection: automatically selects Python 3.12 first, then Python 3.11.

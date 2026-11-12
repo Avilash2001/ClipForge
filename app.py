@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import queue
 import subprocess
 import threading
@@ -123,9 +124,9 @@ class ClipperApp(ctk.CTk):
         for col in range(4):
             settings.grid_columnconfigure(col, weight=1)
         self.game_var = ctk.StringVar(value="Auto / mixed games")
-        self.count_var = ctk.StringVar(value="10")
-        self.length_var = ctk.StringVar(value="35")
-        self.stride_var = ctk.StringVar(value="15")
+        self.count_var = ctk.StringVar(value="Auto")
+        self.length_var = ctk.StringVar(value="Auto")
+        self.stride_var = ctk.StringVar(value="Auto")
         self.whisper_var = ctk.StringVar(value="small")
         self.ollama_var = ctk.StringVar(value=DEFAULT_OLLAMA_MODEL)
         self.device_var = ctk.StringVar(value="CPU (recommended for first run)")
@@ -136,9 +137,9 @@ class ClipperApp(ctk.CTk):
 
         self._field(settings, "Game profile", self.game_var,
                     ["Auto / mixed games", "Minecraft", "GTA V", "FPS / Tactical", "Battle Royale", "Other"], 0)
-        self._field(settings, "Number of clips", self.count_var, ["5", "10", "15", "20"], 1)
-        self._field(settings, "Clip length (sec)", self.length_var, ["30", "35", "40", "45", "60"], 2)
-        self._field(settings, "Scan interval (sec)", self.stride_var, ["10", "12", "15", "20"], 3)
+        self._field(settings, "Number of clips", self.count_var, ["Auto", "5", "10", "15", "20"], 1)
+        self._field(settings, "Clip length (sec)", self.length_var, ["Auto", "30", "35", "40", "45", "60"], 2)
+        self._field(settings, "Scan interval (sec)", self.stride_var, ["Auto", "5", "10", "12", "15", "20"], 3)
         self._field(settings, "Whisper model", self.whisper_var, ["tiny", "base", "small", "medium"], 0, row=3)
         self._field(settings, "Transcription device", self.device_var,
                     ["CPU (recommended for first run)", "CUDA (advanced; requires compatible CUDA libraries)"], 1, row=3)
@@ -155,7 +156,7 @@ class ClipperApp(ctk.CTk):
                     ["Fit + blurred background", "Fill (center crop)"], 1, row=5)
         ctk.CTkLabel(
             settings,
-            text="Mixed mode detects language per speech segment. Visual AI checks sampled frames to demote menus and starting screens.",
+            text="Story Auto chooses a longer story window and denser scan so setup, action and payoff stay together. Manual values remain available.",
             text_color="#aeb5c8", anchor="w", justify="left", wraplength=520
         ).grid(row=5, column=2, columnspan=2, sticky="w", padx=16, pady=(27, 8))
         self.burn_captions_var = ctk.BooleanVar(value=True)
@@ -223,6 +224,9 @@ class ClipperApp(ctk.CTk):
         self.open_output_button = ctk.CTkButton(buttons, text="Open output", width=120, height=42,
                                                 command=self._open_output)
         self.open_output_button.pack(side="left")
+        self.review_button = ctk.CTkButton(buttons, text="Review clips", width=115, height=42,
+                                           command=self._review_output)
+        self.review_button.pack(side="left", padx=(8, 0))
 
         # Logs panel
         logs = self._card(body, "LIVE LOG")
@@ -336,13 +340,13 @@ class ClipperApp(ctk.CTk):
             return
         source = url or local
         try:
-            count = int(self.count_var.get())
-            length = int(self.length_var.get())
-            stride = int(self.stride_var.get())
-            if count < 1 or length < 10 or stride < 5:
+            count = None if self.count_var.get() == "Auto" else int(self.count_var.get())
+            length = None if self.length_var.get() == "Auto" else int(self.length_var.get())
+            stride = None if self.stride_var.get() == "Auto" else int(self.stride_var.get())
+            if (count is not None and count < 1) or (length is not None and length < 10) or (stride is not None and stride < 5):
                 raise ValueError
         except ValueError:
-            messagebox.showwarning("Invalid settings", "Use a positive clip count, clip length >=10 sec and scan interval >=5 sec.")
+            messagebox.showwarning("Invalid settings", "Use Auto, or a positive clip count, duration >=10 sec and scan interval >=5 sec.")
             return
         output_text = self.output_var.get().strip()
         if not output_text:
@@ -449,6 +453,7 @@ class ClipperApp(ctk.CTk):
                     self.stage_bar.set(1)
                     self.percent_label.configure(text="100%")
                     self._finish_job()
+                    self._review_output()
                     messagebox.showinfo("Clipping complete", f"Your clips were saved here:\n\n{item[1]}")
                 elif kind == "cancelled":
                     self._append_log(item[1])
@@ -500,6 +505,99 @@ class ClipperApp(ctk.CTk):
                 subprocess.Popen(["xdg-open", str(path)], start_new_session=True)
         except Exception as exc:
             messagebox.showerror("Could not open folder", str(exc))
+
+    def _review_output(self):
+        """Show rendered visual previews and ready-to-post social copy in the app."""
+        job_dir = self.current_output
+        if not job_dir or not job_dir.exists():
+            candidates = sorted(Path(self.output_var.get()).glob("*/clips.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            job_dir = candidates[0].parent if candidates else None
+        manifest_path = job_dir / "clips.json" if job_dir else None
+        if not manifest_path or not manifest_path.is_file():
+            messagebox.showinfo("No clips to review", "Complete a clipping job first, then review the thumbnails, video files and post copy here.")
+            return
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Could not load clips", str(exc))
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("ClipForge · Review & publish")
+        dialog.geometry("1040x760")
+        dialog.configure(fg_color="#11131b")
+        ctk.CTkLabel(dialog, text="REVIEW & PUBLISH", font=ctk.CTkFont(size=20, weight="bold")).pack(anchor="w", padx=22, pady=(18, 2))
+        ctk.CTkLabel(dialog, text="Preview each rendered clip, copy the ready-to-post text, then mark it posted. Status is saved in this job's clips.json.", text_color="#aeb5c8").pack(anchor="w", padx=22, pady=(0, 12))
+        scroll = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        for clip in manifest.get("clips", []):
+            self._review_card(scroll, job_dir, manifest_path, manifest, clip)
+
+    def _review_card(self, parent, job_dir: Path, manifest_path: Path, manifest: dict, clip: dict):
+        card = ctk.CTkFrame(parent, fg_color="#191c28", corner_radius=12)
+        card.pack(fill="x", pady=(0, 10), padx=2)
+        card.grid_columnconfigure(1, weight=1)
+        thumbnail = job_dir / str(clip.get("thumbnail") or "")
+        if thumbnail.is_file():
+            try:
+                from PIL import Image
+                source_image = Image.open(thumbnail)
+                image = ctk.CTkImage(light_image=source_image, dark_image=source_image, size=(178, 100))
+                preview = ctk.CTkLabel(card, text="", image=image)
+                preview.image = image
+                preview.grid(row=0, column=0, rowspan=4, padx=12, pady=12)
+            except Exception:
+                ctk.CTkLabel(card, text="Preview unavailable", width=178).grid(row=0, column=0, rowspan=4, padx=12, pady=12)
+        else:
+            ctk.CTkLabel(card, text="No preview", width=178).grid(row=0, column=0, rowspan=4, padx=12, pady=12)
+        title = clip.get("title_suggestion") or clip.get("social_title") or "Gaming highlight"
+        ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=15, weight="bold"), anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=(12, 2))
+        story = f"{clip.get('start', 0):.0f}s–{clip.get('end', 0):.0f}s  ·  Story score {clip.get('story_score', 0):.0%}  ·  {clip.get('reason', '')}"
+        ctk.CTkLabel(card, text=story, text_color="#aeb5c8", anchor="w", justify="left", wraplength=650).grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=2)
+        tags = " ".join("#" + str(tag).lstrip("#") for tag in clip.get("hashtags", []))
+        post_text = (clip.get("social_caption") or "") + ("\n\n" + tags if tags else "")
+        post = ctk.CTkTextbox(card, height=58, fg_color="#10131d", text_color="#d9deed")
+        post.grid(row=2, column=1, sticky="ew", padx=(0, 12), pady=(3, 8))
+        post.insert("1.0", post_text.strip())
+        post.configure(state="disabled")
+        controls = ctk.CTkFrame(card, fg_color="transparent")
+        controls.grid(row=3, column=1, sticky="w", pady=(0, 12))
+        ctk.CTkButton(controls, text="Play clip", width=92, command=lambda p=job_dir / clip.get("file", ""): self._open_file(p)).pack(side="left", padx=(0, 7))
+        ctk.CTkButton(controls, text="Copy post", width=92, command=lambda t=post_text: self._copy_post(t)).pack(side="left", padx=(0, 7))
+        posted = ctk.BooleanVar(value=bool(clip.get("posted", False)))
+        check = ctk.CTkCheckBox(controls, text="Posted", variable=posted, onvalue=True, offvalue=False,
+                                command=lambda c=clip, v=posted: self._set_posted(manifest_path, manifest, c, bool(v.get())))
+        check.pack(side="left")
+
+    def _set_posted(self, manifest_path: Path, manifest: dict, clip: dict, posted: bool):
+        clip["posted"] = posted
+        try:
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            metadata = manifest_path.parent / (Path(clip.get("file", "clip")).stem + ".metadata.json")
+            if metadata.exists():
+                metadata.write_text(json.dumps(clip, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Could not save posted status", str(exc))
+
+    def _copy_post(self, text: str):
+        self.clipboard_clear()
+        self.clipboard_append(text.strip())
+        self.update()
+
+    @staticmethod
+    def _open_file(path: Path):
+        if not path.is_file():
+            messagebox.showerror("Clip unavailable", f"Could not find:\n{path}")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)], start_new_session=True)
+            else:
+                subprocess.Popen(["xdg-open", str(path)], start_new_session=True)
+        except Exception as exc:
+            messagebox.showerror("Could not open clip", str(exc))
 
     def _on_close(self):
         if self.running:
