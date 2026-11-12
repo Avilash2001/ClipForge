@@ -1,0 +1,87 @@
+name: Build desktop release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: ClipForge-Windows-x64
+          - os: macos-latest
+            artifact: ClipForge-macOS
+          - os: ubuntu-22.04
+            artifact: ClipForge-Linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk patchelf libglib2.0-0 libsm6 libxext6 libxrender1
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+      - name: Build windowed app
+        run: >-
+          python -m PyInstaller --noconfirm --clean --onedir --windowed
+          --name ClipForge
+          --collect-all customtkinter
+          --collect-all faster_whisper
+          --collect-all ctranslate2
+          --collect-all av
+          --collect-all yt_dlp
+          --collect-all cv2
+          app.py
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item README.md, LICENSE -Destination dist/ClipForge/
+          Compress-Archive -Path dist/ClipForge -DestinationPath '${{ matrix.artifact }}.zip' -Force
+      - name: Package macOS artifact
+        if: runner.os == 'macOS'
+        run: |
+          if [ -d dist/ClipForge.app ]; then
+            ditto -c -k --sequesterRsrc --keepParent dist/ClipForge.app '${{ matrix.artifact }}.zip'
+          else
+            ditto -c -k --sequesterRsrc --keepParent dist/ClipForge '${{ matrix.artifact }}.zip'
+          fi
+      - name: Package Linux artifact
+        if: runner.os == 'Linux'
+        run: |
+          cp README.md LICENSE dist/ClipForge/
+          tar -czf '${{ matrix.artifact }}.tar.gz' -C dist ClipForge
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

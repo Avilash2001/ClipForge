@@ -1,0 +1,28 @@
+[project]
+name = "clipforge-local"
+version = "1.3.2"
+description = "Local-first multimodal gaming VOD clipper"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { file = "LICENSE" }
+authors = [{ name = "ClipForge contributors" }]
+dependencies = [
+  "customtkinter>=5.2.2,<6",
+  "faster-whisper>=1.1.0",
+  "av==18.1.0",
+  "numpy>=1.26.0",
+  "opencv-python-headless>=4.10.0",
+  "requests>=2.31.0",
+  "platformdirs>=4.2.0",
+  "yt-dlp[default]>=2025.1.15",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6", "pyinstaller>=6.0"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,55 @@
+# Local runtime data: never commit source recordings, generated clips or logs
+/input/
+/output/
+/logs/
+/cuda-libs/
+
+# Python environments and caches
+.venv/
+.venv-broken-*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Model caches / runtime configuration
+.cache/
+models/
+model_cache/
+clipforge_config.json
+config.local.json
+.env
+.env.*
+!.env.example
+
+# Build output and packaged apps
+build/
+dist/
+*.spec.bak
+*.egg-info/
+.DS_Store
+Thumbs.db
+*.log
+
+# Generated media / transcripts / clip metadata (in case created outside output/)
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.avi
+*.wav
+*.mp3
+*.m4a
+*.srt
+*.ass
+*_thumbnail.jpg
+transcript.json
+clips.json
+
+# Browser cookies and exported authentication data - NEVER COMMIT
+cookies.txt
+*cookie*.txt
+*.sqlite-wal
+*.sqlite-shm

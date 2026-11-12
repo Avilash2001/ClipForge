@@ -1,0 +1,31 @@
+CLIPFORGE 1.3.2 — PROJECT / CROSS-PLATFORM UPDATE
+
+Recommended: install this version into a NEW folder first (for example D:\ClipForge-v1.3.2). This avoids overwriting a previous version while preserving its virtual environment and outputs.
+
+WINDOWS
+1. Extract the ZIP into D:\ClipForge-v1.3.2.
+2. Keep input/, output/ and logs/ as local runtime data; they are created automatically and are git-ignored.
+3. Install Python 3.11 or 3.12 or 3.12, FFmpeg, Deno 2.3+, and Ollama.
+4. Run Setup.bat.
+5. Run Start ClipForge.bat (not the Debug launcher for normal use).
+6. Confirm the title/header says v1.3.2.
+7. For YouTube VODs, choose the browser signed into YouTube. For the most reliable test, browse to the already-downloaded local video first.
+
+MACOS / LINUX
+1. Install Python 3.11 or 3.12 or 3.12, FFmpeg + ffprobe, Deno 2.3+, and Ollama.
+2. Run ./setup.sh.
+3. Start with ./run.sh. On macOS, launch.command is also available.
+
+WHAT CHANGED IN 1.3.2
+- Multilingual per-segment Whisper mode for English/Bengali/Hindi, transcript quality checks, stereo channel retry, and Medium-model retry.
+- Nine-frame chronological gameplay contact sheets plus speech context passed to a local vision-language Ollama model.
+- Structured/retried AI ranking, story-aware setup/action/payoff scoring, and explicit demotion of starting screens, menus, lobbies, loading screens and scoreboards.
+- Fit/blur or fill/crop portrait framing, optional word-highlight ASS captions, SRT/ASS sidecars, loudness normalisation, thumbnails and per-clip title/caption/hashtag metadata.
+- FFmpeg child-process isolation and a close guard to reduce accidental job interruption.
+- Cross-platform setup scripts, GitHub CI, and GitHub Actions release builds.
+
+IMPORTANT
+- This is a local-first experimental editor, not a guaranteed viral-highlight detector. Review each clip before publishing.
+- Voice chat must actually be present and audible in the source recording.
+- Do not commit input/, output/, logs/, cookies, browser profile data, model caches or generated media.
+- GitHub release builds are produced separately on Windows, macOS and Linux runners; packaged releases still require FFmpeg, Ollama and model downloads.
