@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.6.0
+
+Picking quality. A review of v1.5 output found clips that opened on loading/buy screens, titles that overstated what happened, and banter about skins scored as the best moment.
+
+- **Grounded picks.** The picker must quote the payoff line word for word. Moments whose quote is not actually in the transcript are dropped. The prompt now lists what counts as filler: settings, skins, mic/ping talk, buying, menus, inside jokes, and planning with no outcome.
+- **Edge check.** Each finalist's first and last seconds are labelled by the vision model, and clips are trimmed so they never open on a menu, loading, scoreboard or death screen, or end on a menu. Hopeless clips are dropped.
+- **Critic pass.** The text model re-judges the finalists side by side, as a stranger scrolling Shorts would, and states what actually happens in each clip. It fact-checks every title against the speech and frames and rewrites overstated titles. Its score feeds the final ranking and the Min score filter.
+- **Picking model.** A separate Ollama model is used for picking and the critic. **Auto** picks the best installed judge (`gemma4:12b` if present) and otherwise uses the vision model. In side-by-side tests, qwen3.5:9b and qwen2.5-coder:14b both accepted a false "one bullet kills the entire squad" title. gemma4:12b correctly saw that the streamer was the one being killed.
+- A title the critic marks as unsupported is rewritten, or removed if no accurate rewrite is given. It is never burned in as-is.
+- Overlapping duplicate words from Whisper no longer stack two captions on top of each other.
+- **Only the minutes it needs.** With a usable transcript, moments are picked first and analysis frames are decoded only around them, instead of decoding a frame for every second of the whole stream. The full scan is still used when there is no speech.
+- **Story games.** The picker, visual reviewer and critic are told that cutscene dialogue belongs to the game's characters. Titles describe the scene, e.g. "Prison fight breaks out over a MOM joke", instead of crediting the streamer with a character's lines.
+- **Uneven and moving split-screen.** A divider anywhere in the middle half of the frame is detected per clip, not only one at the exact centre. A divider that stays centred means 50/50 co-op, which is stacked. A divider that is off-centre, or that slides around within the clip (as A Way Out's does), gets a crop inside the panel that is visible in every frame, so the divider never lands mid-clip.
+- **Fix:** two jobs on the same video (e.g. the app and the CLI) could pick the same output folder and overwrite each other's `clips.json`. A job now claims its folder when it starts.
+- **No padding.** If no moment clears the Min score, the job finishes without rendering a known-bad clip and the app says so. Only a near miss (within 15 points) is still shown.
+- **Transcript cache.** Re-running a video with the same Whisper settings reuses its transcript instead of re-transcribing. The cache is in `cache/transcripts`; use **Re-transcribe** or `--fresh-transcript` to force a new transcription.
+- Snapping to sentences respects hard start/end limits, so trimming can never snap back onto a loading screen.
+
 ## v1.5.0
 
 Picking:

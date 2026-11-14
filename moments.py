@@ -276,16 +276,21 @@ def _flat_words(rows: list[dict]) -> list[dict]:
 
 
 def snap_to_speech(start: float, end: float, rows: list[dict], duration: float,
-                   min_len: float, max_len: float) -> tuple[float, float]:
+                   min_len: float, max_len: float, *, not_before: Optional[float] = None,
+                   not_after: Optional[float] = None) -> tuple[float, float]:
     """Move a rough (start, end) onto sentence boundaries.
 
     The clip starts at the beginning of a sentence (never on filler such as
     "uh, so yeah"), ends after the sentence that carries the payoff, and keeps a
     short tail for the reaction. Length is clamped to [min_len, max_len].
+    ``not_before`` / ``not_after`` are hard limits (e.g. a loading screen that must
+    stay outside the clip); they win over sentence alignment.
     """
-    start = max(0.0, float(start))
-    end = min(float(duration), max(start + 1.0, float(end)))
-    words = _flat_words(rows)
+    floor = max(0.0, float(not_before)) if not_before is not None else 0.0
+    ceiling = min(float(duration), float(not_after)) if not_after is not None else float(duration)
+    start = max(floor, float(start))
+    end = min(ceiling, max(start + 1.0, float(end)))
+    words = [w for w in _flat_words(rows) if w["start"] >= floor - 0.05 and w["end"] <= ceiling + 0.05]
     if not words:
         new_start, new_end = start, end
     else:
@@ -309,31 +314,32 @@ def snap_to_speech(start: float, end: float, rows: list[dict], duration: float,
                    and words[idx + 1]["start"] < end - min_len * 0.5):
                 idx += 1
                 trimmed += 1
-            new_start = max(0.0, words[idx]["start"] - 0.25)
+            new_start = max(floor, words[idx]["start"] - 0.25)
         else:
             new_start = start
         # End: finish the sentence that is running at the rough end (up to 6s later).
         tail = [w for w in words if w["sentence_end"] and end - 0.5 <= w["end"] <= end + 6.0]
-        new_end = (tail[0]["end"] + 0.7) if tail else end
+        new_end = min(ceiling, (tail[0]["end"] + 0.7) if tail else end)
         if new_end - new_start < min_len:
             # Too short: first pull in ~40% of the missing time as setup (from an earlier sentence start)...
             deficit = min_len - (new_end - new_start)
             earlier = [w for w in words if w["sentence_start"]
                        and new_start - deficit * 0.6 <= w["start"] - 0.25 <= new_start - deficit * 0.25]
             if earlier:
-                new_start = max(0.0, earlier[0]["start"] - 0.25)
+                new_start = max(floor, earlier[0]["start"] - 0.25)
         if new_end - new_start < min_len:
             # ...then let the payoff/reaction run on to later sentence ends.
             later = [w for w in words if w["sentence_end"] and w["end"] + 0.7 >= new_start + min_len
                      and w["end"] + 0.7 <= new_start + max_len]
-            new_end = (later[0]["end"] + 0.7) if later else new_start + min_len
+            new_end = min(ceiling, (later[0]["end"] + 0.7) if later else new_start + min_len)
         if new_end - new_start > max_len:
             fits = [w for w in words if w["sentence_end"]
                     and new_start + min_len <= w["end"] + 0.7 <= new_start + max_len]
             new_end = (fits[-1]["end"] + 0.7) if fits else new_start + max_len
-    new_end = min(float(duration), new_end)
+    new_end = min(ceiling, new_end)
     if new_end - new_start < min(min_len, duration):
-        new_start = max(0.0, new_end - min_len)
+        new_start = max(floor, new_end - min_len)
+        new_end = min(ceiling, max(new_end, new_start + min_len))
     return round(new_start, 2), round(new_end, 2)
 
 
@@ -352,6 +358,7 @@ class Moment:
     post_caption: str = ""
     hashtags: list[str] = field(default_factory=list)
     needs_context: bool = False
+    payoff_quote: str = ""
 
 
 def extract_json_object(text: str) -> dict:
@@ -438,12 +445,13 @@ MOMENT_SCHEMA = {
                     "category": {"type": "string", "enum": MOMENT_CATEGORIES},
                     "score": {"type": "integer"},
                     "needs_context": {"type": "boolean"},
+                    "payoff_quote": {"type": "string"},
                     "hook_title": {"type": "string"},
                     "why": {"type": "string"},
                     "post_caption": {"type": "string"},
                     "hashtags": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["start", "end", "category", "score", "needs_context", "hook_title", "why"],
+                "required": ["start", "end", "category", "score", "needs_context", "payoff_quote", "hook_title", "why"],
             },
         }
     },
@@ -461,12 +469,19 @@ def moment_prompt(lines: list[str], chunk_start: float, chunk_end: float, *, min
         f"Below is the timestamped transcript for {chunk_start/60:.0f}-{chunk_end/60:.0f} min of the stream. "
         "[LOUD] marks where the streamer's voice/volume suddenly spiked. [CHAT SPIKE] marks where live chat suddenly "
         "moved much faster than normal. Both are strong hints that something happened, but the words decide.\n\n"
-        "Pick the moments people actually share: first reactions, crazy discoveries, full-on freakouts or rage, funny fails, "
-        "hot takes, clutch or impressive plays, roasts/banter, wholesome or awkward moments.\n"
+        "Pick only moments a STRANGER scrolling Shorts would stop for: something actually HAPPENS and people react to it. "
+        "In story games much of the speech is the game's own characters (cutscene dialogue), not the streamer. Only credit words or reactions to the streamer when it is clearly them (commentary, reactions, talking to teammates); for a cutscene moment, title the scene itself, e.g. 'Bank heist goes WRONG in the first minute'. "
+        "Good: a death, kill, clutch or fail with a big reaction; a surprise or crazy discovery; a full-on freakout or "
+        "rage; a genuinely funny line that lands on its own; a first reaction to something new.\n"
+        "Filler that must score below 40: talking about settings, graphics, skins, mic/audio problems, ping or lag; "
+        "buying weapons or waiting in menus/lobbies; planning or callouts with no outcome; inside jokes and nicknames; "
+        "people just repeating a word; anything where you cannot say what happened.\n"
         "Rules:\n"
-        "- Be harsh. Most of a stream is filler. Return 0-4 moments for this section; returning none is fine.\n"
+        "- Be harsh. Return 0-3 moments for this section; returning none is normal and correct for most sections.\n"
         "- Each moment must make sense to someone who has never seen this stream. If it needs earlier context, set "
         "needs_context=true and score it below 30.\n"
+        "- payoff_quote: copy, word for word from the transcript, the line where the payoff/reaction happens. If you "
+        "cannot point to such a line, it is not a moment.\n"
         "- start = where the setup begins: the start of a full sentence, never mid-sentence, never on filler like "
         "'uh', 'so yeah', 'anyway'. end = just after the payoff and the reaction land. "
         f"Each moment must be {min_len}-{max_len} seconds long. Use the [Ns] timestamps (seconds).\n"
@@ -475,13 +490,26 @@ def moment_prompt(lines: list[str], chunk_start: float, chunk_end: float, *, min
         "- hook_title: the text shown on the video. Max 60 characters, third person, present tense, curiosity-driven. "
         "Write it in normal sentence case and put ONLY 1-3 key words in CAPITALS (never the whole title). May end with "
         "one emoji. Good: \"TIM can't believe who's STREAMING inside GTA 6 💀\", \"Squad gets SNIPED through a wall 😭\". "
-        "Bad: \"SQUAD GETS SNIPED THROUGH A WALL\". "
-        "Write it in English even if the speech is Hindi or Bengali. Never invent events that are not in the transcript.\n"
+        "Bad: \"SQUAD GETS SNIPED THROUGH A WALL\". Only claim what the transcript proves: if one player dies, do not say "
+        "the whole squad died. Write it in English even if the speech is Hindi or Bengali.\n"
         "- post_caption: one or two ready-to-post sentences ending with a question or call to react. hashtags: 3-5, no #. "
         "Name a specific game only if the Game line above names it; otherwise use generic tags (gaming, fps, funny...).\n"
-        "- why: one short factual sentence quoting what happens.\n\n"
+        "- why: one short factual sentence saying what happens.\n\n"
         "Transcript:\n" + "\n".join(lines)
     )
+
+
+def quote_support(quote: str, rows: list[dict], start: float, end: float, pad: float = 8.0) -> float:
+    """Fraction of the quote's words that really occur in the transcript around the moment (0..1)."""
+    tokens = [_normalise_token(t) for t in str(quote or "").split()]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return 0.0
+    nearby = set()
+    for seg in rows:
+        if seg["end"] >= start - pad and seg["start"] <= end + pad:
+            nearby.update(_normalise_token(t) for t in str(seg.get("text", "")).split())
+    return sum(1 for t in tokens if t in nearby) / len(tokens)
 
 
 _TITLE_STOPWORDS = {
@@ -586,6 +614,13 @@ def pick_moments(rows: list[dict], duration: float, loud: list[float], chat: lis
             needs_context = bool(item.get("needs_context", False))
             if needs_context:
                 score = min(score, 25.0)
+            # Grounding: the payoff line must really be in the transcript near the moment.
+            support = quote_support(item.get("payoff_quote", ""), rows, start, end)
+            if support < 0.5:
+                if log:
+                    log(f"  dropped {start:.0f}-{end:.0f}s: payoff quote not found in transcript "
+                        f"({str(item.get('payoff_quote', ''))[:60]!r})")
+                continue
             tags = item.get("hashtags") if isinstance(item.get("hashtags"), list) else []
             moments.append(Moment(
                 start=start, end=end, score=score,
@@ -595,6 +630,7 @@ def pick_moments(rows: list[dict], duration: float, loud: list[float], chat: lis
                 post_caption=str(item.get("post_caption", "")).strip()[:260],
                 hashtags=[str(t).lstrip("#").strip()[:40] for t in tags[:5] if str(t).strip()],
                 needs_context=needs_context,
+                payoff_quote=str(item.get("payoff_quote", "")).strip()[:200],
             ))
             found += 1
         if log:
@@ -603,3 +639,89 @@ def pick_moments(rows: list[dict], duration: float, loud: list[float], chat: lis
         if on_chunk:
             on_chunk(number, len(starts), len(moments))
     return dedupe_moments(moments)
+
+
+# ---------------------------------------------------------------------------
+# Critic pass: re-judge the finalists side by side
+# ---------------------------------------------------------------------------
+
+CRITIC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "what_happens": {"type": "string"},
+                    "stranger_score": {"type": "integer"},
+                    "title_supported": {"type": "boolean"},
+                    "fixed_title": {"type": "string"},
+                    "keep": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "what_happens", "stranger_score", "title_supported", "fixed_title", "keep", "reason"],
+            },
+        }
+    },
+    "required": ["verdicts"],
+}
+
+
+def critic_prompt(items: list[dict], game_profile: str, creator: str) -> str:
+    who = f"The streamer is {creator}. " if creator else ""
+    return (
+        "You are the final reviewer for a gaming Shorts channel. A first pass already picked these candidate clips "
+        f"from a {game_profile} stream. {who}Re-judge them side by side, harshly, as a STRANGER scrolling Shorts who "
+        "has never seen this streamer.\n"
+        "For each clip:\n"
+        "- what_happens: in one plain sentence, what actually happens in the clip (from the speech and the frame "
+        "summary). If you cannot say, write 'nothing clear'.\n"
+        "- stranger_score 0-100: would a stranger stop scrolling and watch to the end? Something must HAPPEN with a "
+        "clear payoff (a death, kill, clutch, fail, surprise, rage, a line that is funny on its own). Talk about "
+        "settings, graphics, skins, audio/mic, ping, buying weapons, menus, planning without an outcome, inside jokes, "
+        "or people repeating a word scores below 35. 'nothing clear' scores below 20.\n"
+        "- title_supported: is every claim in the title backed by the speech or frame summary? (e.g. a title saying "
+        "'the whole squad' died when one player died is NOT supported).\n"
+        "- fixed_title: ALWAYS fill it. If the title is supported, repeat it; if not, write an accurate replacement "
+        "that describes what_happens in the same style (sentence case, 1-3 CAPS words, "
+        "optional emoji, max 60 characters); otherwise repeat the title.\n"
+        "- keep: true only if you would actually post it.\n"
+        "In story games much of the speech is the game's own characters (cutscene dialogue), not the streamer. Only credit words or reactions to the streamer when it is clearly them (commentary, reactions, talking to teammates); for a cutscene moment, title the scene itself, e.g. 'Bank heist goes WRONG in the first minute'. A title that credits the streamer with a game character's line is NOT supported.\n"
+        "Compare the clips with each other; be consistent. Return a verdict for every index.\n\n"
+        "Clips:\n" + json.dumps(items, ensure_ascii=False, indent=1)
+    )
+
+
+def critique(items: list[dict], *, url: str, model: str, game_profile: str = "Auto / mixed games",
+             creator: str = "", log: Optional[Callable[[str], None]] = None,
+             batch_size: int = 6) -> dict[int, dict]:
+    """Ask the text model to re-judge finalists. Returns {index: verdict}; missing indexes were not judged."""
+    verdicts: dict[int, dict] = {}
+    for offset in range(0, len(items), batch_size):
+        batch = items[offset:offset + batch_size]
+        try:
+            data = ollama_json(url, model, critic_prompt(batch, game_profile, creator), CRITIC_SCHEMA,
+                               temperature=0.1, num_ctx=16384, num_predict=1600, timeout=900)
+        except Exception as exc:  # noqa: BLE001 - the critic is an extra filter, never a hard dependency
+            if log:
+                log(f"Critic pass failed for {len(batch)} clip(s): {exc}")
+            continue
+        valid = {item["index"] for item in batch}
+        for verdict in data.get("verdicts", []) or []:
+            try:
+                index = int(verdict.get("index", -1))
+                if index not in valid:
+                    continue
+                verdicts[index] = {
+                    "stranger_score": max(0.0, min(100.0, float(verdict.get("stranger_score", 0)))),
+                    "keep": bool(verdict.get("keep", False)),
+                    "title_supported": bool(verdict.get("title_supported", True)),
+                    "fixed_title": tidy_hook_title(verdict.get("fixed_title", "")),
+                    "what_happens": str(verdict.get("what_happens", "")).strip()[:200],
+                    "reason": str(verdict.get("reason", "")).strip()[:200],
+                }
+            except (TypeError, ValueError):
+                continue
+    return verdicts

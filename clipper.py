@@ -25,6 +25,10 @@ def main():
     parser.add_argument("--creator", default="", help="Streamer name for hook titles (default: YouTube channel)")
     parser.add_argument("--no-title", action="store_true", help="Do not burn the hook title on the video")
     parser.add_argument("--no-chat", action="store_true", help="Do not use YouTube live-chat replay spikes")
+    parser.add_argument("--picker-model", default=None,
+                        help="Ollama text model for moment picking and the critic (default: best installed, e.g. gemma4:12b)")
+    parser.add_argument("--fresh-transcript", action="store_true",
+                        help="Re-run Whisper even if this video was transcribed before")
     parser.add_argument("--whisper-model", default="small", choices=["tiny", "base", "small", "medium"])
     parser.add_argument("--whisper-device", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--ollama-model", default="qwen3.5:9b")
@@ -52,6 +56,7 @@ def main():
         normalize_audio=not args.no_normalize_audio, cookies_browser=args.cookies_browser,
         facecam_mode=args.facecam, min_score=None if args.min_score < 0 else args.min_score,
         creator_name=args.creator, burn_title=not args.no_title, use_chat=not args.no_chat,
+        picker_model=args.picker_model, use_transcript_cache=not args.fresh_transcript,
         progress=report, log=lambda m: print(m, flush=True)
     )
     print(f"\nDone. Clips saved to: {result}")

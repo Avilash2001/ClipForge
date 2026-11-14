@@ -11,6 +11,7 @@ import threading
 import time
 import wave
 import base64
+import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -24,16 +25,17 @@ from clip_style import (
     FACECAM_AUTO, LAYOUT_AUTO, LAYOUT_SPLIT, Box,
 )
 from moments import (
-    Moment, chat_spikes, clean_transcript, extract_json_object, loudness_spikes, ollama_json, tidy_hook_title,
+    Moment, chat_spikes, clean_transcript, critique, extract_json_object, loudness_spikes, ollama_json,
+    tidy_hook_title,
     parse_live_chat, pick_moments, range_peak, snap_to_speech,
 )
-from paths import INPUT_DIR, OUTPUT_DIR
+from paths import CACHE_DIR, INPUT_DIR, OUTPUT_DIR
 
 DEFAULT_INPUT_DIR = INPUT_DIR
 DEFAULT_OUTPUT_DIR = OUTPUT_DIR
 OLLAMA_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 DEFAULT_MIN_SCORE = 60
 YOUTUBE_ID_IN_NAME = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi"}
@@ -85,6 +87,10 @@ class Candidate:
     quality: float = -1.0         # 0..100 publish-readiness; -1 = not judged by AI
     split_screen: bool = False
     content_band: tuple = (0.0, 1.0)
+    seam_x: Optional[float] = None   # position of an off-centre split-screen divider
+    critic_score: float = -1.0     # 0..100 from the side-by-side critic pass; -1 = not judged
+    critic_note: str = ""
+    edge_labels: list = None        # screen types of the first/last frames
 
 
 def _emit(progress: Optional[ProgressCallback], stage: str, stage_pct: float,
@@ -131,6 +137,28 @@ def check_tools() -> None:
             "Missing required command(s): " + ", ".join(missing) +
             ". Install FFmpeg, reopen the app, and try again."
         )
+
+
+# Text models that judged clips best in testing, best first. Used when no picking model is set.
+PICKER_PREFERENCE = ["gemma4:12b", "qwen3.5:27b", "gemma4:27b"]
+
+
+def installed_ollama_models() -> list[str]:
+    try:
+        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
+        response.raise_for_status()
+        return [m.get("name", "") for m in response.json().get("models", [])]
+    except Exception:
+        return []
+
+
+def preferred_picker_model(fallback: str) -> str:
+    """Best installed judge for transcript picking and the critic; falls back to the vision model."""
+    installed = set(installed_ollama_models())
+    for name in PICKER_PREFERENCE:
+        if name in installed:
+            return name
+    return fallback
 
 
 def get_ollama_status(model: str = DEFAULT_OLLAMA_MODEL) -> tuple[bool, str]:
@@ -495,8 +523,8 @@ def visual_motion_by_second(video: Path, duration: float, frame_dir: Path,
     This is a generic activity heuristic, not semantic kill detection.
     """
     try:
-        import cv2
-        import numpy as np
+        import cv2  # noqa: F401 - availability check for a friendly setup error
+        import numpy as np  # noqa: F401
     except ImportError as exc:
         raise RuntimeError("OpenCV is missing. Run Setup.bat to install the visual-analysis dependency.") from exc
 
@@ -514,29 +542,66 @@ def visual_motion_by_second(video: Path, duration: float, frame_dir: Path,
     frame_files = sorted(frame_dir.glob("frame_*.jpg"))
     if not frame_files:
         raise RuntimeError("FFmpeg could not extract visual-analysis frames.")
+    motion = motion_from_frames(frame_dir, duration, progress, cancel_event)
+    _log(log, f"Visual motion analysis complete ({len(frame_files)} sampled frames).")
+    return motion
+
+
+def extract_window_frames(video: Path, windows: list[tuple[float, float]], frame_dir: Path,
+                          cancel_event: Optional[threading.Event] = None) -> int:
+    """Decode 1 fps analysis frames only around candidate moments (not the whole stream).
+
+    Frames are named by their second (frame_000123.jpg), exactly like a full-video pass, so
+    contact sheets, motion and layout checks work the same way.
+    """
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    merged: list[list[float]] = []
+    for a, b in sorted((max(0.0, a), b) for a, b in windows):
+        if merged and a <= merged[-1][1] + 5:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    for a, b in merged:
+        _check_cancel(cancel_event)
+        first = int(a)
+        _run_process([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", str(first), "-i", str(video),
+            "-t", f"{max(1.0, b - first):.0f}", "-an", "-vf", "fps=1,scale=320:180:flags=bilinear",
+            "-q:v", "7", "-start_number", str(first), str(frame_dir / "frame_%06d.jpg"),
+        ], check=True, capture_output=True, text=True)
+    return int(sum(b - a for a, b in merged))
+
+
+def motion_from_frames(frame_dir: Path, duration: float,
+                       progress: Optional[ProgressCallback] = None,
+                       cancel_event: Optional[threading.Event] = None) -> list[float]:
+    """Frame-to-frame change per second (0..1, normalised to the 95th percentile)."""
+    import cv2
+    import numpy as np
 
     motion = [0.0] * max(1, int(math.ceil(duration)))
-    previous = None
-    for idx, frame_path in enumerate(frame_files):
+    files = sorted(frame_dir.glob("frame_*.jpg"))
+    previous, previous_second = None, None
+    for n, frame_path in enumerate(files):
         _check_cancel(cancel_event)
+        try:
+            second = int(frame_path.stem.split("_")[-1])
+        except ValueError:
+            continue
         frame = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
         if frame is None:
+            previous = None
             continue
-        if previous is not None and idx < len(motion):
-            diff = cv2.absdiff(frame, previous)
-            motion[idx] = float(np.mean(diff) / 255.0)
-        previous = frame
-        if progress and (idx % 20 == 0 or idx == len(frame_files) - 1):
-            pct = (idx + 1) / max(1, len(frame_files)) * 100
+        if previous is not None and previous_second == second - 1 and second < len(motion):
+            motion[second] = float(np.mean(cv2.absdiff(frame, previous)) / 255.0)
+        previous, previous_second = frame, second
+        if progress and (n % 20 == 0 or n == len(files) - 1):
+            pct = (n + 1) / max(1, len(files)) * 100
             _emit(progress, "Visual analysis", pct, 75.5 + pct * 0.045,
-                  f"Analysing gameplay movement: {idx+1}/{len(frame_files)} sampled frames")
-
+                  f"Analysing gameplay movement: {n + 1}/{len(files)} sampled frames")
     positive = [v for v in motion if v > 0]
-    ceiling = float(np.percentile(positive, 95)) if positive else 0.01
-    ceiling = max(ceiling, 0.008)
-    normalised = [max(0.0, min(1.0, value / ceiling)) for value in motion]
-    _log(log, f"Visual motion analysis complete ({len(frame_files)} sampled frames).")
-    return normalised
+    ceiling = max(float(np.percentile(positive, 95)) if positive else 0.01, 0.008)
+    return [max(0.0, min(1.0, value / ceiling)) for value in motion]
 
 
 def _motion_score_for_range(motion: list[float], start: float, end: float) -> float:
@@ -660,6 +725,7 @@ def candidates_from_moments(moments: list[Moment], duration: float, energies: li
             origin="moment", category=moment.category, hook_title=moment.hook_title,
             moment_score=moment.score, loud_score=loud_peak, chat_score=chat_peak,
             reason=moment.why, social_title=moment.hook_title, social_caption=moment.post_caption,
+            payoff=moment.payoff_quote,
             hashtags=list(moment.hashtags), event_type=moment.category,
         )
         _score_without_vision(candidate)
@@ -704,6 +770,7 @@ def _rank_batch(candidates: list[Candidate], model: str, game_profile: str,
     prompt = (
         f"You are a harsh short-form gaming editor reviewing {game_profile} footage for YouTube Shorts / TikTok. {who}"
         "Each attached image is a 3x3 contact sheet for one candidate; its nine frames are in chronological order. "
+        "In story games much of the speech is the game's own characters (cutscene dialogue), not the streamer. Only credit words or reactions to the streamer when it is clearly them (commentary, reactions, talking to teammates); for a cutscene moment, title the scene itself, e.g. 'Bank heist goes WRONG in the first minute'. "
         "Use the visual sequence AND the speech context together. Do not infer a kill, win, clutch or funny event "
         "unless visible frames or transcript support it. Judge whether the clip is a COMPLETE, standalone mini-story: "
         "a viewer who has not watched the VOD must understand the hook/setup, action/escalation, payoff, and reaction. "
@@ -1004,14 +1071,205 @@ def write_post_file(path: Path, candidate: Candidate) -> None:
     path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
 
 
-def _transcribe_clean(audio_path: Path, model_name: str, device: str, duration: float, language_mode: str,
-                      progress, cancel_event, log):
-    rows, language = transcribe(audio_path, model_name, device, duration, progress, cancel_event, log, language_mode)
-    cleaned, stats = clean_transcript(rows, language_mode)
-    if stats["segments_dropped"] or stats["words_dropped"]:
-        _log(log, f"Transcript clean-up removed {stats['segments_dropped']} unreliable segment(s) and "
-                  f"{stats['words_dropped']} hallucinated/low-confidence word(s).")
-    return cleaned, language, transcript_quality(cleaned)
+def claim_job_dir(output_root: Path, job_name: str) -> Path:
+    """Reserve an output folder for this job.
+
+    A folder counts as taken as soon as it has any content - not only once a finished
+    job wrote clips.json - so two jobs on the same video (e.g. the GUI and the CLI) can
+    never write into, and overwrite, the same folder. Empty leftovers are reused.
+    """
+    output_root.mkdir(parents=True, exist_ok=True)
+    suffix = 1
+    while True:
+        job_dir = output_root / (job_name if suffix == 1 else f"{job_name}_{suffix}")
+        try:
+            job_dir.mkdir()
+            return job_dir
+        except FileExistsError:
+            if job_dir.is_dir() and not any(job_dir.iterdir()):
+                return job_dir
+            suffix += 1
+
+
+def transcript_cache_path(video: Path, whisper_model: str, language_mode: str) -> Path:
+    """Cache key: the file (path, size, mtime) plus the Whisper settings that change the result."""
+    stat = video.stat()
+    key = f"{video.resolve()}|{stat.st_size}|{int(stat.st_mtime)}|{whisper_model}|{language_mode}|raw-v1"
+    return CACHE_DIR / "transcripts" / (hashlib.sha1(key.encode("utf-8")).hexdigest()[:24] + ".json")
+
+
+def _transcription_stage(video: Path, wav_path: Path, temp_dir: Path, whisper_model: str, whisper_device: str,
+                         duration: float, language_mode: str, progress, cancel_event, log) -> tuple[list[dict], str, str]:
+    """Run Whisper with the stereo-channel and Medium fallbacks and return the best RAW rows.
+
+    Raw rows are returned (not cleaned) so they can be cached and re-cleaned by future versions.
+    """
+    def run(path: Path, model: str):
+        raw, lang = transcribe(path, model, whisper_device, duration, progress, cancel_event, log, language_mode)
+        cleaned, _ = clean_transcript(raw, language_mode)
+        return raw, lang, transcript_quality(cleaned)
+
+    raw, language, quality = run(wav_path, whisper_model)
+    source = wav_path
+    # Check individual stereo channels if a mixed-down track produced punctuation/no speech.
+    if not quality["usable"] and audio_channel_count(video) >= 2:
+        _log(log, "Transcript quality is poor. Checking left/right channels for isolated voice chat...")
+        options = [(raw, language, quality, wav_path)]
+        for channel in ("FL", "FR"):
+            _check_cancel(cancel_event)
+            channel_path = temp_dir / f"audio_{channel.lower()}.wav"
+            try:
+                extract_channel_wav(video, channel_path, channel)
+                channel_raw, channel_language, channel_quality = run(channel_path, whisper_model)
+                options.append((channel_raw, channel_language, channel_quality, channel_path))
+                _log(log, f"{channel} channel: {channel_quality['word_count']} word tokens.")
+                if channel_quality["usable"]:
+                    break
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                _log(log, f"Could not transcribe {channel} channel: {exc}")
+        raw, language, quality, source = max(
+            options, key=lambda item: (item[2]["usable"], item[2]["word_count"], item[2]["alphanumeric_characters"]))
+    # A punctuation-only result is never considered a transcript. Retry Medium if needed.
+    if not quality["usable"] and whisper_model != "medium":
+        _log(log, (
+            f"Transcript validation failed ({quality['word_count']} words; "
+            f"{quality['alphanumeric_characters']} alphanumeric characters). "
+            "Retrying Whisper medium with per-segment mixed-language detection."
+        ))
+        retry_raw, retry_language, retry_quality = run(source, "medium")
+        if (retry_quality["usable"], retry_quality["word_count"]) > (quality["usable"], quality["word_count"]):
+            raw, language, quality = retry_raw, retry_language, retry_quality
+        if quality["usable"]:
+            _log(log, f"Medium retry recovered {quality['word_count']} word tokens.")
+        else:
+            _log(log, "WARNING: Speech remains unusable. The voice-chat mix may be absent, very quiet or overlapped; "
+                      "captions will be skipped.")
+    return raw, language, source.name
+
+
+# Screen types for the first/last seconds of a clip. A clip must not open on any of
+# BAD_START_SCREENS; it may end on a death or round banner (that is often the payoff),
+# but not on a menu or loading screen.
+EDGE_LABELS = ["gameplay", "menu_or_shop", "loading_or_lobby", "scoreboard_or_banner", "death_or_spectate",
+               "cutscene", "other"]
+BAD_START_SCREENS = {"menu_or_shop", "loading_or_lobby", "scoreboard_or_banner", "death_or_spectate"}
+BAD_END_SCREENS = {"menu_or_shop", "loading_or_lobby"}
+
+
+def edge_times(start: float, end: float) -> list[float]:
+    length = max(1.0, end - start)
+    lead = [0.4, min(2.0, length * 0.15), min(4.0, length * 0.3)]
+    return [start + x for x in lead] + [end - lead[2], end - lead[1], end - lead[0]]
+
+
+def _edge_sheet(video: Path, times: list[float], work_dir: Path, tag: str) -> Optional[str]:
+    import cv2
+    import numpy as np
+
+    tiles = []
+    for i, t in enumerate(times):
+        out = work_dir / f"{tag}_{i}.jpg"
+        _run_process(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0.0, t):.2f}",
+                      "-i", str(video), "-frames:v", "1", "-vf", "scale=480:270", "-q:v", "4", str(out)],
+                     check=False, capture_output=True, text=True)
+        tile = cv2.imread(str(out), cv2.IMREAD_COLOR)
+        if tile is None or tile.shape[:2] != (270, 480):
+            tile = np.zeros((270, 480, 3), dtype=np.uint8)
+        label = f"{i + 1} {'START' if i < 3 else 'END'}"
+        cv2.rectangle(tile, (0, 0), (150, 40), (0, 0, 0), -1)
+        cv2.putText(tile, label, (8, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+        tiles.append(tile)
+    sheet = np.vstack([np.hstack(tiles[:3]), np.hstack(tiles[3:])])
+    ok, encoded = cv2.imencode(".jpg", sheet, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return base64.b64encode(encoded.tobytes()).decode("ascii") if ok else None
+
+
+def edge_review(candidates: list[Candidate], video: Path, model: str, work_dir: Path,
+                log: Optional[LogCallback] = None,
+                cancel_event: Optional[threading.Event] = None) -> dict[int, list[str]]:
+    """Label the first and last seconds of each finalist (gameplay vs menu/loading/death screens)."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    schema = {
+        "type": "object",
+        "properties": {"clips": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"index": {"type": "integer"},
+                           "frames": {"type": "array", "items": {"type": "string", "enum": EDGE_LABELS}}},
+            "required": ["index", "frames"]}}},
+        "required": ["clips"],
+    }
+    labels: dict[int, list[str]] = {}
+    for offset in range(0, len(candidates), 3):
+        _check_cancel(cancel_event)
+        batch = candidates[offset:offset + 3]
+        sheets = [_edge_sheet(video, edge_times(c.start, c.end), work_dir, f"edge{c.index}") for c in batch]
+        if any(sheet is None for sheet in sheets):
+            continue
+        prompt = (
+            "Each attached image belongs to one gaming clip and shows 6 numbered frames: frames 1-3 are the clip's "
+            "first seconds, frames 4-6 its last seconds. Label every frame with exactly one screen type:\n"
+            "- gameplay: the player is controlling a character in the game world (HUD and crosshair visible).\n"
+            "- menu_or_shop: a menu, weapon/agent shop, inventory or settings screen covers the view.\n"
+            "- loading_or_lobby: loading screen, match/map intro or 'versus' screen, lobby, queue, character select.\n"
+            "- scoreboard_or_banner: scoreboard, round won/lost banner, match summary.\n"
+            "- death_or_spectate: the player is dead: kill-cam, death recap, spectating a teammate, ragdoll or "
+            "upside-down/death camera.\n"
+            "- cutscene: a non-interactive story scene.\n- other: anything else.\n"
+            "Images in order have these indexes: " + json.dumps([c.index for c in batch]) +
+            ". Return JSON with 6 labels per clip, in frame order."
+        )
+        try:
+            data = ollama_json(OLLAMA_URL, model, prompt, schema, images=sheets, temperature=0.0,
+                               num_ctx=8192, num_predict=600, timeout=900)
+        except Exception as exc:  # noqa: BLE001 - edge checks are an extra filter
+            _log(log, f"Edge check failed for {len(batch)} clip(s): {exc}")
+            continue
+        valid = {c.index for c in batch}
+        for item in data.get("clips", []) or []:
+            try:
+                index = int(item.get("index", -1))
+            except (TypeError, ValueError):
+                continue
+            frames = [str(x) for x in (item.get("frames") or [])][:6]
+            if index in valid and len(frames) == 6:
+                labels[index] = frames
+    return labels
+
+
+def apply_edge_labels(c: Candidate, labels: list[str], transcript: list[dict], transcript_usable: bool,
+                      duration: float, min_len: float, max_len: float) -> Optional[str]:
+    """Trim menu/loading/death screens off the clip edges. Returns a reason string if the clip must be dropped."""
+    times = edge_times(c.start, c.end)
+    lead = 0
+    while lead < 3 and labels[lead] in BAD_START_SCREENS:
+        lead += 1
+    trail = 0
+    while trail < 3 and labels[5 - trail] in BAD_END_SCREENS:
+        trail += 1
+    if lead == 0 and trail == 0:
+        return None
+    if lead == 3 and trail == 3:
+        return f"starts on {labels[0]} and ends on {labels[5]}"
+    not_before = None
+    if lead:
+        not_before = (times[lead - 1] + times[lead]) / 2 if lead < 3 else times[2] + 1.5
+    not_after = None
+    if trail:
+        first_bad = 6 - trail
+        not_after = (times[first_bad - 1] + times[first_bad]) / 2 if trail < 3 else times[3] - 1.0
+    rough_start = max(c.start, not_before) if not_before is not None else c.start
+    rough_end = min(c.end, not_after) if not_after is not None else c.end
+    if transcript_usable:
+        new_start, new_end = snap_to_speech(rough_start, rough_end, transcript, duration, min_len, max_len,
+                                            not_before=not_before, not_after=not_after)
+    else:
+        new_start, new_end = rough_start, rough_end
+    if new_end - new_start < max(8.0, 0.75 * min_len):
+        return f"too short after trimming {labels[0] if lead else labels[5]} screens"
+    c.start, c.end = round(new_start, 2), round(new_end, 2)
+    return None
 
 
 def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optional[int] = None,
@@ -1029,6 +1287,8 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
                 creator_name: str = "",
                 burn_title: bool = True,
                 use_chat: bool = True,
+                picker_model: Optional[str] = None,
+                use_transcript_cache: bool = True,
                 progress: Optional[ProgressCallback] = None,
                 log: Optional[LogCallback] = None,
                 cancel_event: Optional[threading.Event] = None) -> Path:
@@ -1074,12 +1334,7 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
               f"{'off' if min_score is None else int(min_score)}/100 · layout: {render_layout}"
               + (f" · streamer: {creator}" if creator else ""))
     job_name = re.sub(r"[^A-Za-z0-9_-]+", "_", video.stem)[:70].strip("_") or "gaming_video"
-    job_dir = output_root / job_name
-    suffix = 2
-    while job_dir.exists() and (job_dir / "clips.json").exists():
-        job_dir = output_root / f"{job_name}_{suffix}"
-        suffix += 1
-    job_dir.mkdir(parents=True, exist_ok=True)
+    job_dir = claim_job_dir(output_root, job_name)
 
     # Extract once, then use the exact same WAV for loudness analysis and Whisper.
     # This avoids a second audio decode path through PyAV.
@@ -1096,59 +1351,44 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
         _log(log, f"Loudness spikes: {sum(1 for v in loud if v >= 0.5)} second(s) clearly above the local baseline.")
         _emit(progress, "Audio analysis", 100, 15, "Audio analysis complete")
 
-        _log(log, f"Transcribing with faster-whisper ({whisper_model}, {whisper_device}); {language_mode}...")
-        transcript, language, quality = _transcribe_clean(
-            wav_path, whisper_model, whisper_device, duration, language_mode, progress, cancel_event, log)
-        selected_audio_path = wav_path
-
-        # Check individual stereo channels if a mixed-down track produced punctuation/no speech.
-        if not quality["usable"] and audio_channel_count(video) >= 2:
-            _log(log, "Transcript quality is poor. Checking left/right channels for isolated voice chat...")
-            channel_candidates = [(transcript, language, quality, wav_path)]
-            for channel in ("FL", "FR"):
-                _check_cancel(cancel_event)
-                channel_path = Path(temp) / f"audio_{channel.lower()}.wav"
-                try:
-                    extract_channel_wav(video, channel_path, channel)
-                    channel_rows, channel_language, channel_quality = _transcribe_clean(
-                        channel_path, whisper_model, whisper_device, duration, language_mode,
-                        progress, cancel_event, log)
-                    channel_candidates.append((channel_rows, channel_language, channel_quality, channel_path))
-                    _log(log, f"{channel} channel: {channel_quality['word_count']} word tokens.")
-                    if channel_quality["usable"]:
-                        break
-                except JobCancelled:
-                    raise
-                except Exception as exc:
-                    _log(log, f"Could not transcribe {channel} channel: {exc}")
-            transcript, language, quality, selected_audio_path = max(
-                channel_candidates,
-                key=lambda item: (item[2]["usable"], item[2]["word_count"], item[2]["alphanumeric_characters"])
-            )
-
-        # A punctuation-only result is never considered a transcript. Retry Medium if needed.
-        if not quality["usable"] and whisper_model != "medium":
-            _log(log, (
-                f"Transcript validation failed ({quality['word_count']} words; "
-                f"{quality['alphanumeric_characters']} alphanumeric characters). "
-                "Retrying Whisper medium with per-segment mixed-language detection."
-            ))
-            retry_rows, retry_language, retry_quality = _transcribe_clean(
-                selected_audio_path, "medium", whisper_device, duration, language_mode,
+        cache_path = transcript_cache_path(video, whisper_model, language_mode)
+        cached = None
+        if use_transcript_cache and cache_path.is_file():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                cached = None
+        if cached and isinstance(cached.get("raw_segments"), list):
+            raw_rows, language, audio_source = cached["raw_segments"], cached.get("language", "unknown"), \
+                cached.get("audio_source", "cache")
+            _log(log, "Re-using the saved transcript from an earlier run of this video "
+                      f"({whisper_model}, {language_mode}); skipping Whisper.")
+            _emit(progress, "Transcribing", 100, 75, "Re-used saved transcript")
+        else:
+            _log(log, f"Transcribing with faster-whisper ({whisper_model}, {whisper_device}); {language_mode}...")
+            raw_rows, language, audio_source = _transcription_stage(
+                video, wav_path, Path(temp), whisper_model, whisper_device, duration, language_mode,
                 progress, cancel_event, log)
-            if (retry_quality["usable"], retry_quality["word_count"]) > (quality["usable"], quality["word_count"]):
-                transcript, language, quality = retry_rows, retry_language, retry_quality
-            if quality["usable"]:
-                _log(log, f"Medium retry recovered {quality['word_count']} word tokens.")
-            else:
-                _log(log, "WARNING: Speech remains unusable. The voice-chat mix may be absent, very quiet or overlapped; captions will be skipped.")
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps({
+                    "video": str(video), "whisper_model": whisper_model, "language_mode": language_mode,
+                    "language": language, "audio_source": audio_source, "raw_segments": raw_rows,
+                }, ensure_ascii=False), encoding="utf-8")
+            except OSError as exc:
+                _log(log, f"Could not save the transcript cache: {exc}")
+        transcript, clean_stats = clean_transcript(raw_rows, language_mode)
+        quality = transcript_quality(transcript)
+        if clean_stats["segments_dropped"] or clean_stats["words_dropped"]:
+            _log(log, f"Transcript clean-up removed {clean_stats['segments_dropped']} unreliable segment(s) and "
+                      f"{clean_stats['words_dropped']} hallucinated/low-confidence word(s).")
 
     transcript_usable = bool(quality["usable"])
     (job_dir / "transcript.json").write_text(
         json.dumps({
             "language": language,
             "language_mode": language_mode,
-            "audio_source": selected_audio_path.name,
+            "audio_source": audio_source,
             "quality": quality,
             "segments": transcript
         }, ensure_ascii=False, indent=2),
@@ -1190,7 +1430,7 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
 
     frame_temp_obj = tempfile.TemporaryDirectory(prefix="clipforge_frames_")
     frame_dir = Path(frame_temp_obj.name)
-    motion = visual_motion_by_second(video, duration, frame_dir, progress, cancel_event, log)
+    motion: Optional[list[float]] = None  # decoded after picking when the transcript path is used
 
     facecam: Optional[Box] = None
     if render_layout in (LAYOUT_AUTO, LAYOUT_SPLIT):
@@ -1207,27 +1447,39 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
         if render_layout == LAYOUT_SPLIT and facecam is None:
             _log(log, "No facecam available for the split layout; falling back to Gameplay zoom.")
 
+    text_model = (picker_model or "").strip() or preferred_picker_model(ollama_model)
+    if use_ollama:
+        _log(log, f"Picking/critic model: {text_model} · vision model: {ollama_model}")
     candidates: list[Candidate] = []
     if transcript_usable and use_ollama:
-        _log(log, f"Reading the transcript in 12-minute chunks for shareable moments ({ollama_model})...")
-        _emit(progress, "Finding moments", 0, 80.5, "Reading the transcript for shareable moments...")
+        _log(log, f"Reading the transcript in 12-minute chunks for shareable moments ({text_model})...")
+        _emit(progress, "Finding moments", 0, 76, "Reading the transcript for shareable moments...")
         try:
             moments = pick_moments(
-                transcript, duration, loud, chat, url=OLLAMA_URL, model=ollama_model,
+                transcript, duration, loud, chat, url=OLLAMA_URL, model=text_model,
                 min_len=min_len, max_len=max_len, game_profile=game_profile, creator=creator,
                 on_chunk=lambda i, n, found: _emit(
-                    progress, "Finding moments", i / n * 100, 80.5 + 3.5 * i / n,
+                    progress, "Finding moments", i / n * 100, 76 + 8 * i / n,
                     f"Read transcript chunk {i}/{n} · {found} possible moments so far"),
                 log=lambda m: _log(log, m), check_cancel=lambda: _check_cancel(cancel_event),
             )
             _log(log, f"Transcript moment picker found {len(moments)} possible moments.")
-            candidates = candidates_from_moments(moments, duration, energies, transcript, motion, loud, chat,
-                                                 min_len, max_len)
+            if moments:
+                # Like a human editor: only decode the minutes around the picked moments.
+                _emit(progress, "Visual analysis", 0, 84, "Sampling frames around the picked moments...")
+                decoded = extract_window_frames(video, [(m.start - 20, m.end + 20) for m in moments],
+                                                frame_dir, cancel_event)
+                motion = motion_from_frames(frame_dir, duration, None, cancel_event)
+                _log(log, f"Sampled frames for {decoded / 60:.1f} of {duration / 60:.1f} minutes around the moments.")
+                candidates = candidates_from_moments(moments, duration, energies, transcript, motion, loud, chat,
+                                                     min_len, max_len)
         except JobCancelled:
             raise
         except Exception as exc:
             _log(log, f"Transcript moment picker unavailable; falling back to scanning windows. Details: {exc}")
     if not candidates:
+        if motion is None or not any(frame_dir.glob("frame_*.jpg")):
+            motion = visual_motion_by_second(video, duration, frame_dir, progress, cancel_event, log)
         candidates = build_candidates(duration, energies, transcript, motion, window_len, stride,
                                       transcript_usable, loud, chat)
         if transcript_usable:
@@ -1261,21 +1513,97 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
             _score_without_vision(c)
         _emit(progress, "AI ranking", 100, 88, "Local visual/audio ranking complete")
 
-    leaderboard = sorted(candidates, key=lambda c: c.final_score, reverse=True)
-    _log(log, f"{len(candidates)} possible moments, best first:")
+    # Finalists get two extra checks before anything is rendered:
+    # 1) edge check - no clip may open on a menu/loading/death screen or end on a menu;
+    # 2) critic - the text model re-judges the finalists side by side as a stranger would,
+    #    and fact-checks each title against the speech and the frame summary.
+    rejected_screens = {"menu_lobby", "starting_screen", "loading_screen", "scoreboard"}
+    pool = [c for c in sorted(candidates, key=lambda c: c.final_score, reverse=True)
+            if c.screen_type not in rejected_screens
+            and not (min_score is not None and 0 <= c.quality < min_score * 0.7)]
+    finalists = pool[:max(count * 2, count + 3)]
+    if use_ollama and finalists:
+        _emit(progress, "Final checks", 0, 88, f"Checking the first/last seconds of {len(finalists)} finalists...")
+        try:
+            with tempfile.TemporaryDirectory(prefix="clipforge_edges_") as edge_dir:
+                edge_labels = edge_review(finalists, video, ollama_model, Path(edge_dir), log, cancel_event)
+            for c in finalists:
+                labels = edge_labels.get(c.index)
+                if not labels:
+                    continue
+                c.edge_labels = labels
+                before = (c.start, c.end)
+                problem = apply_edge_labels(c, labels, transcript, transcript_usable, duration, min_len, max_len)
+                if problem:
+                    c.quality, c.final_score = 0.0, c.final_score * 0.1
+                    _log(log, f"  dropped {before[0]/60:.1f}m clip: {problem}")
+                elif (c.start, c.end) != before:
+                    c.transcript = transcript_for_range(transcript, c.start, c.end)[:900]
+                    _log(log, f"  trimmed {before[0]/60:.1f}m clip to {c.start:.1f}-{c.end:.1f}s "
+                              f"(edges: {', '.join(labels)})")
+        except JobCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _log(log, f"Edge check unavailable: {exc}")
+        finalists = [c for c in finalists if c.quality != 0.0]
+        if transcript_usable and finalists:
+            _emit(progress, "Final checks", 50, 89, f"Critic re-judging {len(finalists)} finalists...")
+            items = [{
+                "index": c.index,
+                "seconds": round(c.end - c.start),
+                "title": c.hook_title or c.social_title,
+                "category": c.category or c.event_type,
+                "speech_before": transcript_for_range(transcript, max(0, c.start - 20), c.start)[:300],
+                "speech_in_clip": transcript_for_range(transcript, c.start, c.end)[:900],
+                "speech_after": transcript_for_range(transcript, c.end, min(duration, c.end + 8))[:200],
+                "frames_summary": " ".join(x for x in (c.setup, c.payoff, c.reason) if x)[:400],
+            } for c in finalists]
+            verdicts = critique(items, url=OLLAMA_URL, model=text_model, game_profile=game_profile,
+                                creator=creator, log=lambda m: _log(log, m))
+            for c in finalists:
+                verdict = verdicts.get(c.index)
+                if not verdict:
+                    continue
+                c.critic_score = verdict["stranger_score"]
+                c.critic_note = verdict["what_happens"] or verdict["reason"]
+                if not verdict["title_supported"]:
+                    fixed = verdict["fixed_title"]
+                    if fixed and fixed.lower() != (c.hook_title or "").lower():
+                        _log(log, f"  title fixed: {c.hook_title!r} -> {fixed!r}")
+                        c.hook_title = c.social_title = fixed
+                    else:
+                        # Never burn a title the critic says is false; the captions still carry the clip.
+                        _log(log, f"  title removed (not supported by the clip): {c.hook_title!r}")
+                        c.hook_title = ""
+                base_quality = c.quality if c.quality >= 0 else c.critic_score
+                c.quality = 0.5 * c.critic_score + 0.5 * base_quality
+                c.final_score = 0.45 * c.critic_score / 100 + 0.55 * c.final_score
+                if not verdict["keep"]:
+                    c.quality = min(c.quality, 35.0)
+                    c.final_score *= 0.5
+        _emit(progress, "Final checks", 100, 90, "Final checks complete")
+
+    leaderboard = sorted(finalists or candidates, key=lambda c: c.final_score, reverse=True)
+    _log(log, f"{len(candidates)} possible moments; finalists best first:")
     for c in leaderboard[:12]:
         score = f"{c.quality:3.0f}" if c.quality >= 0 else "  -"
+        note = f"  [{c.critic_note[:60]}]" if c.critic_note else ""
         _log(log, f"  {score}  {c.start/60:5.1f}m  {(c.end - c.start):4.0f}s  "
-                  f"{(c.hook_title or c.social_title or c.reason or '')[:70]}")
-    selected = choose_top(candidates, count, min_score)
-    if not selected:
-        selected = choose_top(candidates, 1)
+                  f"{(c.hook_title or c.social_title or c.reason or '')[:60]}{note}")
+    selection_pool = finalists or candidates
+    selected = choose_top(selection_pool, count, min_score)
+    if not selected and min_score is not None:
+        # A near miss is still worth showing; a clip the checks explicitly rejected (quality 0) is not.
+        near_misses = [c for c in candidates if c.quality < 0 or c.quality >= max(1.0, min_score - 15)]
+        selected = choose_top(near_misses, 1)
         if selected:
-            _log(log, f"No moment reached the minimum score of {int(min_score or 0)}; keeping the single best one so "
-                      "you can judge it. Lower 'Min score' to get more clips.")
+            _log(log, f"No moment reached the minimum score of {int(min_score)}; keeping the closest one so you can "
+                      "judge it. Lower 'Min score' to get more clips.")
     if not selected:
-        raise RuntimeError("No clips were selected.")
-    _log(log, f"Kept the best {len(selected)} of {len(candidates)} possible moments.")
+        _log(log, "No moment in this video cleared the bar, so nothing was rendered. Most streams are filler; this "
+                  "is the picker refusing to pad. Lower 'Min score' or use a stronger picking model to see more.")
+    else:
+        _log(log, f"Kept the best {len(selected)} of {len(candidates)} possible moments.")
     _log(log, "AI selection is based on the transcript and sampled frames; always review clips before publishing.")
 
     # Per-clip frame traits (co-op split-screen, letterbox bars) from the 1 fps analysis frames.
@@ -1285,6 +1613,7 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
             traits = clip_style.clip_frame_traits([p for p in paths if p.exists()])
             c.split_screen = traits["split_screen"]
             c.content_band = tuple(traits["band"])
+            c.seam_x = traits.get("seam_x")
         except Exception as exc:  # noqa: BLE001 - styling hints are optional
             _log(log, f"Could not inspect clip frames for layout hints: {exc}")
     frame_temp_obj.cleanup()
@@ -1311,7 +1640,8 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
             thumbnail = job_dir / f"{name}.jpg"
             post_file = job_dir / f"{name}.post.txt"
             plan = clip_style.plan_layout(render_layout, src_w, src_h, facecam,
-                                          split_screen=candidate.split_screen, band=tuple(candidate.content_band))
+                                          split_screen=candidate.split_screen, band=tuple(candidate.content_band),
+                                          seam_x=candidate.seam_x)
             _log(log, f"Rendering clip {n}/{len(selected)}: {candidate.start:.1f}s – {candidate.end:.1f}s "
                       f"({candidate.end - candidate.start:.0f}s, {plan.name})")
             subtitle_written = write_clip_srt(transcript, candidate.start, candidate.end, srt) if transcript_usable else False
@@ -1358,7 +1688,7 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
                 json.dumps(manifest_row, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             pct = n / len(selected) * 100
-            _emit(progress, "Rendering clips", pct, 88 + pct * 0.12,
+            _emit(progress, "Rendering clips", pct, 90 + pct * 0.10,
                   f"Rendered {n}/{len(selected)} clips")
 
     (job_dir / "clips.json").write_text(json.dumps({
@@ -1383,6 +1713,7 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
         "burn_title": burn_title,
         "normalize_audio": normalize_audio,
         "live_chat_used": bool(chat),
+        "picker_model": text_model,
         "candidates_considered": len(candidates),
         "clips": manifest
     }, ensure_ascii=False, indent=2), encoding="utf-8")

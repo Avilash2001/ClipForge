@@ -2,6 +2,7 @@
 /input/
 /output/
 /logs/
+/cache/
 /cuda-libs/
 
 # Python environments and caches

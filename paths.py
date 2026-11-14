@@ -13,6 +13,7 @@ else:
 INPUT_DIR = DATA_DIR / "input"
 OUTPUT_DIR = DATA_DIR / "output"
 LOG_DIR = DATA_DIR / "logs"
+CACHE_DIR = DATA_DIR / "cache"  # saved transcripts so re-runs skip Whisper
 
 for directory in (INPUT_DIR, OUTPUT_DIR, LOG_DIR):
     directory.mkdir(parents=True, exist_ok=True)
