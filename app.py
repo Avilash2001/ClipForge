@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import json
 import queue
@@ -13,8 +14,9 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+from clip_style import FACECAM_AUTO, FACECAM_OPTIONS, LAYOUT_AUTO, LAYOUTS
 from clipper_engine import (
-    APP_VERSION, DEFAULT_OLLAMA_MODEL, DEFAULT_INPUT_DIR, DEFAULT_OUTPUT_DIR,
+    APP_VERSION, DEFAULT_MIN_SCORE, DEFAULT_OLLAMA_MODEL, DEFAULT_INPUT_DIR, DEFAULT_OUTPUT_DIR,
     JobCancelled, get_ollama_status, process_job, format_eta
 )
 from paths import LOG_DIR
@@ -73,7 +75,7 @@ class ClipperApp(ctk.CTk):
         input_card = self._card(body, "1  ·  SOURCE VIDEO")
         input_card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         input_card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(input_card, text="YouTube URL (video you own or are authorised to use)",
+        ctk.CTkLabel(input_card, text="YouTube / Twitch / Kick URL (a stream you own or are authorised to clip)",
                      text_color="#aeb5c8").grid(row=1, column=0, sticky="w", padx=16, pady=(8, 5))
         self.url_var = ctk.StringVar()
         url_row = ctk.CTkFrame(input_card, fg_color="transparent")
@@ -131,20 +133,26 @@ class ClipperApp(ctk.CTk):
         self.ollama_var = ctk.StringVar(value=DEFAULT_OLLAMA_MODEL)
         self.device_var = ctk.StringVar(value="CPU (recommended for first run)")
         self.language_mode_var = ctk.StringVar(value="Mixed (English + Bengali + Hindi)")
-        self.render_layout_var = ctk.StringVar(value="Fit + blurred background")
+        self.render_layout_var = ctk.StringVar(value=LAYOUT_AUTO)
+        self.facecam_var = ctk.StringVar(value=FACECAM_AUTO)
+        self.min_score_var = ctk.StringVar(value=str(DEFAULT_MIN_SCORE))
+        self.creator_var = ctk.StringVar(value="")
         self.ollama_enabled = ctk.BooleanVar(value=True)
         self.nvenc_enabled = ctk.BooleanVar(value=True)
 
         self._field(settings, "Game profile", self.game_var,
-                    ["Auto / mixed games", "Minecraft", "GTA V", "FPS / Tactical", "Battle Royale", "Other"], 0)
-        self._field(settings, "Number of clips", self.count_var, ["Auto", "5", "10", "15", "20"], 1)
-        self._field(settings, "Clip length (sec)", self.length_var, ["Auto", "30", "35", "40", "45", "60"], 2)
-        self._field(settings, "Scan interval (sec)", self.stride_var, ["Auto", "5", "10", "12", "15", "20"], 3)
+                    ["Auto / mixed games", "Valorant", "Minecraft", "GTA V", "GTA 6", "FPS / Tactical",
+                     "Battle Royale", "Co-op adventure (A Way Out etc.)", "Other"], 0)
+        self._field(settings, "Max clips", self.count_var, ["Auto", "3", "5", "8", "10", "15"], 1)
+        self._field(settings, "Max clip length (sec)", self.length_var, ["Auto", "30", "35", "45", "60", "90"], 2)
+        self._field(settings, "Min score (0-100)", self.min_score_var, ["Off", "50", "60", "70", "80"], 3)
         self._field(settings, "Whisper model", self.whisper_var, ["tiny", "base", "small", "medium"], 0, row=3)
         self._field(settings, "Transcription device", self.device_var,
                     ["CPU (recommended for first run)", "CUDA (advanced; requires compatible CUDA libraries)"], 1, row=3)
         self._field(settings, "Ollama model", self.ollama_var, None, 2, row=3)
-        self.ollama_check = ctk.CTkCheckBox(settings, text="Use local Ollama visual AI ranking",
+        self._field(settings, "Fallback scan interval (sec)", self.stride_var,
+                    ["Auto", "5", "10", "12", "15", "20"], 3, row=3)
+        self.ollama_check = ctk.CTkCheckBox(settings, text="Use local Ollama AI (transcript moments + visual check)",
                                             variable=self.ollama_enabled, onvalue=True, offvalue=False)
         self.ollama_check.grid(row=4, column=0, columnspan=2, sticky="w", padx=16, pady=(10, 7))
         self.nvenc_check = ctk.CTkCheckBox(settings, text="Use NVIDIA NVENC when available",
@@ -152,25 +160,38 @@ class ClipperApp(ctk.CTk):
         self.nvenc_check.grid(row=4, column=2, columnspan=2, sticky="w", padx=16, pady=(10, 7))
         self._field(settings, "Speech language mode", self.language_mode_var,
                     ["Mixed (English + Bengali + Hindi)", "English", "Bengali", "Hindi"], 0, row=5)
-        self._field(settings, "Vertical layout", self.render_layout_var,
-                    ["Fit + blurred background", "Fill (center crop)"], 1, row=5)
-        ctk.CTkLabel(
-            settings,
-            text="Story Auto chooses a longer story window and denser scan so setup, action and payoff stay together. Manual values remain available.",
-            text_color="#aeb5c8", anchor="w", justify="left", wraplength=520
-        ).grid(row=5, column=2, columnspan=2, sticky="w", padx=16, pady=(27, 8))
+        self._field(settings, "Vertical layout", self.render_layout_var, LAYOUTS, 1, row=5)
+        self._field(settings, "Facecam", self.facecam_var, FACECAM_OPTIONS, 2, row=5)
+        self._field(settings, "Streamer name (optional)", self.creator_var, None, 3, row=5)
         self.burn_captions_var = ctk.BooleanVar(value=True)
         self.normalize_audio_var = ctk.BooleanVar(value=True)
+        self.burn_title_var = ctk.BooleanVar(value=True)
+        self.use_chat_var = ctk.BooleanVar(value=True)
         self.burn_captions_check = ctk.CTkCheckBox(
-            settings, text="Burn in animated word-highlight captions when speech is usable",
+            settings, text="Burn in big word-by-word captions when speech is usable",
             variable=self.burn_captions_var
         )
-        self.burn_captions_check.grid(row=6, column=0, columnspan=2, sticky="w", padx=16, pady=(8, 10))
+        self.burn_captions_check.grid(row=6, column=0, columnspan=2, sticky="w", padx=16, pady=(10, 4))
+        self.burn_title_check = ctk.CTkCheckBox(
+            settings, text="Show the AI hook title on the video", variable=self.burn_title_var
+        )
+        self.burn_title_check.grid(row=6, column=2, columnspan=2, sticky="w", padx=16, pady=(10, 4))
+        self.use_chat_check = ctk.CTkCheckBox(
+            settings, text="Use YouTube live-chat spikes (stream replays only)", variable=self.use_chat_var
+        )
+        self.use_chat_check.grid(row=7, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 6))
         self.normalize_audio_check = ctk.CTkCheckBox(
             settings, text="Normalize game/commentary audio for social video",
             variable=self.normalize_audio_var
         )
-        self.normalize_audio_check.grid(row=6, column=2, columnspan=2, sticky="w", padx=16, pady=(8, 10))
+        self.normalize_audio_check.grid(row=7, column=2, columnspan=2, sticky="w", padx=16, pady=(4, 6))
+        ctk.CTkLabel(
+            settings,
+            text=("The AI reads the transcript in 12-minute chunks, scores every moment 0-100 and throws out anything "
+                  "that needs context. Clips start on a sentence and end after the reaction. Min score keeps only "
+                  "moments at or above that score; leave the streamer name blank to use the YouTube channel name."),
+            text_color="#aeb5c8", anchor="w", justify="left", wraplength=940
+        ).grid(row=8, column=0, columnspan=4, sticky="w", padx=16, pady=(4, 12))
 
         # Output
         output = self._card(body, "3  ·  OUTPUT LOCATION")
@@ -330,10 +351,10 @@ class ClipperApp(ctk.CTk):
             self.url_var.set(url)
             if duplicated_url:
                 self._append_log("Detected multiple pasted URLs in the field; using the first URL only.")
-            if not url.lower().startswith(("https://www.youtube.com/", "https://youtube.com/",
-                                           "https://youtu.be/", "http://www.youtube.com/",
-                                           "http://youtube.com/", "http://youtu.be/")):
-                messagebox.showwarning("Invalid YouTube URL", "Paste a YouTube video URL (youtube.com or youtu.be).")
+            host = re.sub(r"^https?://", "", url.lower()).split("/", 1)[0].removeprefix("www.").removeprefix("m.")
+            if host not in ("youtube.com", "youtu.be", "twitch.tv", "kick.com"):
+                messagebox.showwarning("Unsupported URL",
+                                       "Paste a YouTube, Twitch (VOD) or Kick video URL.")
                 return
         if not url and not local:
             messagebox.showwarning("Missing video", "Paste a YouTube URL or browse for a local video file.")
@@ -343,10 +364,14 @@ class ClipperApp(ctk.CTk):
             count = None if self.count_var.get() == "Auto" else int(self.count_var.get())
             length = None if self.length_var.get() == "Auto" else int(self.length_var.get())
             stride = None if self.stride_var.get() == "Auto" else int(self.stride_var.get())
+            min_text = self.min_score_var.get().strip()
+            min_score = None if min_text.lower() in ("off", "none", "") else float(min_text)
             if (count is not None and count < 1) or (length is not None and length < 10) or (stride is not None and stride < 5):
                 raise ValueError
+            if min_score is not None and not 0 <= min_score <= 100:
+                raise ValueError
         except ValueError:
-            messagebox.showwarning("Invalid settings", "Use Auto, or a positive clip count, duration >=10 sec and scan interval >=5 sec.")
+            messagebox.showwarning("Invalid settings", "Use Auto, or a positive clip count, duration >=10 sec, scan interval >=5 sec and a min score of Off or 0-100.")
             return
         output_text = self.output_var.get().strip()
         if not output_text:
@@ -373,6 +398,11 @@ class ClipperApp(ctk.CTk):
             "render_layout": self.render_layout_var.get(),
             "burn_captions": bool(self.burn_captions_var.get()),
             "normalize_audio": bool(self.normalize_audio_var.get()),
+            "facecam_mode": self.facecam_var.get(),
+            "min_score": min_score,
+            "creator_name": self.creator_var.get().strip(),
+            "burn_title": bool(self.burn_title_var.get()),
+            "use_chat": bool(self.use_chat_var.get()),
             "cookies_browser": (None if self.cookies_browser_var.get().startswith("None")
                                 else self.cookies_browser_var.get().strip().lower()),
         }
@@ -412,6 +442,8 @@ class ClipperApp(ctk.CTk):
                 cookies_browser=args["cookies_browser"],
                 language_mode=args["language_mode"], render_layout=args["render_layout"],
                 burn_captions=args["burn_captions"], normalize_audio=args["normalize_audio"],
+                facecam_mode=args["facecam_mode"], min_score=args["min_score"],
+                creator_name=args["creator_name"], burn_title=args["burn_title"], use_chat=args["use_chat"],
                 progress=report, log=log, cancel_event=self.cancel_event,
             )
             self.events.put(("done", str(result)))
@@ -542,7 +574,10 @@ class ClipperApp(ctk.CTk):
             try:
                 from PIL import Image
                 source_image = Image.open(thumbnail)
-                image = ctk.CTkImage(light_image=source_image, dark_image=source_image, size=(178, 100))
+                # v1.5 thumbnails are taken from the finished vertical clip; older jobs are 16:9.
+                width, height = source_image.size
+                size = (101, 180) if height > width else (178, 100)
+                image = ctk.CTkImage(light_image=source_image, dark_image=source_image, size=size)
                 preview = ctk.CTkLabel(card, text="", image=image)
                 preview.image = image
                 preview.grid(row=0, column=0, rowspan=4, padx=12, pady=12)
@@ -552,7 +587,14 @@ class ClipperApp(ctk.CTk):
             ctk.CTkLabel(card, text="No preview", width=178).grid(row=0, column=0, rowspan=4, padx=12, pady=12)
         title = clip.get("title_suggestion") or clip.get("social_title") or "Gaming highlight"
         ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=15, weight="bold"), anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=(12, 2))
-        story = f"{clip.get('start', 0):.0f}s–{clip.get('end', 0):.0f}s  ·  Story score {clip.get('story_score', 0):.0%}  ·  {clip.get('reason', '')}"
+        quality = clip.get("quality", -1)
+        score_text = (f"Score {quality:.0f}/100" if isinstance(quality, (int, float)) and quality >= 0
+                      else f"Story score {clip.get('story_score', 0):.0%}")
+        length = clip.get("end", 0) - clip.get("start", 0)
+        extras = "  ·  ".join(part for part in (
+            str(clip.get("category") or "").replace("_", " "), str(clip.get("layout") or "")) if part)
+        story = (f"{clip.get('start', 0) / 60:.1f} min  ·  {length:.0f}s  ·  {score_text}"
+                 + (f"  ·  {extras}" if extras else "") + f"\n{clip.get('reason', '')}")
         ctk.CTkLabel(card, text=story, text_color="#aeb5c8", anchor="w", justify="left", wraplength=650).grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=2)
         tags = " ".join("#" + str(tag).lstrip("#") for tag in clip.get("hashtags", []))
         post_text = (clip.get("social_caption") or "") + ("\n\n" + tags if tags else "")

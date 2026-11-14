@@ -19,13 +19,23 @@ import requests
 import yt_dlp
 from faster_whisper import WhisperModel
 
+import clip_style
+from clip_style import (
+    FACECAM_AUTO, LAYOUT_AUTO, LAYOUT_SPLIT, Box,
+)
+from moments import (
+    Moment, chat_spikes, clean_transcript, extract_json_object, loudness_spikes, ollama_json, tidy_hook_title,
+    parse_live_chat, pick_moments, range_peak, snap_to_speech,
+)
 from paths import INPUT_DIR, OUTPUT_DIR
 
 DEFAULT_INPUT_DIR = INPUT_DIR
 DEFAULT_OUTPUT_DIR = OUTPUT_DIR
 OLLAMA_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
+DEFAULT_MIN_SCORE = 60
+YOUTUBE_ID_IN_NAME = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi"}
 
 HYPE_WORDS = {
@@ -65,6 +75,16 @@ class Candidate:
     hashtags: list[str] = None
     context_before: str = ""
     context_after: str = ""
+    # v1.5: transcript-first moments, spike signals and publish-readiness.
+    origin: str = "window"        # "moment" (picked from the transcript) or "window" (sliding scan)
+    category: str = ""
+    hook_title: str = ""          # burned-in on-video title
+    moment_score: float = 0.0     # 0..100 from the transcript pass
+    loud_score: float = 0.0       # 0..1 peak loudness spike in the clip
+    chat_score: float = 0.0       # 0..1 peak live-chat spike in the clip
+    quality: float = -1.0         # 0..100 publish-readiness; -1 = not judged by AI
+    split_screen: bool = False
+    content_band: tuple = (0.0, 1.0)
 
 
 def _emit(progress: Optional[ProgressCallback], stage: str, stage_pct: float,
@@ -130,7 +150,8 @@ def download_youtube(url: str, destination: Path,
                      progress: Optional[ProgressCallback] = None,
                      cancel_event: Optional[threading.Event] = None,
                      log: Optional[LogCallback] = None,
-                     cookies_browser: Optional[str] = None) -> Path:
+                     cookies_browser: Optional[str] = None,
+                     info_out: Optional[dict] = None) -> Path:
     destination.mkdir(parents=True, exist_ok=True)
     before = {p.resolve() for p in destination.iterdir() if p.is_file()}
     last_report = 0.0
@@ -208,6 +229,8 @@ def download_youtube(url: str, destination: Path,
             ) from exc
         raise
     _check_cancel(cancel_event)
+    if info_out is not None and isinstance(info, dict):
+        info_out.update({key: info.get(key) for key in ("id", "title", "channel", "uploader", "was_live")})
     video_id = str(info.get("id", "")) if isinstance(info, dict) else ""
     after = [p for p in destination.iterdir()
              if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS and p.resolve() not in before]
@@ -224,6 +247,60 @@ def download_youtube(url: str, destination: Path,
     if not after:
         raise RuntimeError("yt-dlp finished but no video file was found in the Input folder.")
     return max(after, key=lambda p: p.stat().st_mtime)
+
+
+def fetch_live_chat(url: str, work_dir: Path, cookies_browser: Optional[str] = None,
+                    log: Optional[LogCallback] = None,
+                    cancel_event: Optional[threading.Event] = None) -> list[float]:
+    """Download a YouTube live-stream replay's chat and return message offsets in seconds.
+
+    Only replays of YouTube live streams have this; ordinary uploads return an empty list.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    def hook(_info: dict) -> None:
+        _check_cancel(cancel_event)
+
+    class QuietLogger:
+        def debug(self, msg):
+            pass
+
+        def warning(self, msg):
+            pass
+
+        def error(self, msg):
+            _log(log, f"Live chat: {msg}")
+
+    opts = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "subtitleslangs": ["live_chat"],
+        "outtmpl": str(work_dir / "chat.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "logger": QuietLogger(),
+        "progress_hooks": [hook],
+    }
+    if cookies_browser:
+        opts["cookiesfrombrowser"] = (cookies_browser.lower(), None, None, None)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.extract_info(url, download=True)
+    files = sorted(work_dir.glob("*.live_chat.json"))
+    if not files:
+        return []
+    return parse_live_chat(files[0])
+
+
+def video_dimensions(video: Path) -> tuple[int, int]:
+    result = _run_process([
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+        "-of", "csv=p=0", str(video)
+    ], check=False, capture_output=True, text=True)
+    try:
+        width, height = (int(v) for v in result.stdout.strip().splitlines()[0].split(",")[:2])
+        return width, height
+    except (ValueError, IndexError):
+        return 1920, 1080
 
 
 def duration_seconds(video: Path) -> float:
@@ -271,7 +348,7 @@ def extract_channel_wav(video: Path, wav_path: Path, channel: str) -> None:
     ], check=True, capture_output=True, text=True)
 
 
-def audio_energy_by_second(wav_path: Path) -> list[float]:
+def audio_energy_by_second(wav_path: Path, raw: bool = False) -> list[float]:
     # NumPy is installed as a dependency of faster-whisper; vectorising this avoids
     # iterating through tens of millions of samples in Python.
     import numpy as np
@@ -291,6 +368,13 @@ def audio_energy_by_second(wav_path: Path) -> list[float]:
                 values.append(0.0)
             else:
                 values.append(float(np.sqrt(np.mean(samples * samples)) / 32768.0))
+    if not values:
+        return [0.0]
+    return values if raw else normalise_energy(values)
+
+
+def normalise_energy(values: list[float]) -> list[float]:
+    """Scale raw per-second RMS so the 90th percentile is 1.0."""
     if not values:
         return [0.0]
     ordered = sorted(values)
@@ -348,8 +432,13 @@ def transcribe(audio_path: Path, model_name: str, device: str, duration: float,
             "start": float(seg.start),
             "end": float(seg.end),
             "text": seg.text.strip(),
+            # Confidence fields let clean_transcript() drop hallucinated segments.
+            "avg_logprob": round(float(getattr(seg, "avg_logprob", 0.0)), 4),
+            "no_speech_prob": round(float(getattr(seg, "no_speech_prob", 0.0)), 4),
+            "compression_ratio": round(float(getattr(seg, "compression_ratio", 1.0)), 4),
             "words": [
-                {"start": float(w.start), "end": float(w.end), "word": w.word}
+                {"start": float(w.start), "end": float(w.end), "word": w.word,
+                 "probability": round(float(getattr(w, "probability", 1.0)), 4)}
                 for w in (seg.words or [])
             ]
         })
@@ -487,27 +576,7 @@ def _make_contact_sheet(frame_dir: Path, candidate: Candidate, cv2_module) -> st
     return base64.b64encode(encoded.tobytes()).decode("ascii")
 
 
-def _extract_json_object(text: str) -> dict:
-    """Parse JSON directly, or recover the first JSON object embedded in model text."""
-    text = (text or "").strip()
-    if not text:
-        raise ValueError("Ollama returned an empty response.")
-    try:
-        value = json.loads(text)
-        if isinstance(value, dict):
-            return value
-    except json.JSONDecodeError:
-        pass
-    decoder = json.JSONDecoder()
-    for pos, char in enumerate(text):
-        if char == "{":
-            try:
-                value, _ = decoder.raw_decode(text[pos:])
-                if isinstance(value, dict):
-                    return value
-            except json.JSONDecodeError:
-                continue
-    raise ValueError("Ollama response did not contain a valid JSON object.")
+_extract_json_object = extract_json_object
 
 
 def transcript_for_range(rows: list[dict], start: float, end: float) -> str:
@@ -527,7 +596,8 @@ def text_score(text: str) -> float:
 
 def build_candidates(duration: float, energies: list[float], transcript: list[dict],
                      motion: list[float], clip_len: int, stride: int,
-                     transcript_usable: bool) -> list[Candidate]:
+                     transcript_usable: bool, loud: Optional[list[float]] = None,
+                     chat: Optional[list[float]] = None) -> list[Candidate]:
     candidates: list[Candidate] = []
     if duration <= clip_len:
         starts = [0]
@@ -547,10 +617,13 @@ def build_candidates(duration: float, energies: list[float], transcript: list[di
         context_after = transcript_for_range(transcript, end, min(duration, end + 12)) if transcript_usable else ""
         ts = text_score(text) if transcript_usable else 0.0
         visual = _motion_score_for_range(motion, start, end)
+        loud_peak = range_peak(loud or [], start, end)
+        chat_peak = range_peak(chat or [], start, end)
+        signal = max(loud_peak, chat_peak)
         if transcript_usable:
-            baseline = 0.25 * audio + 0.25 * visual + 0.50 * ts
+            baseline = 0.20 * audio + 0.20 * visual + 0.40 * ts + 0.20 * signal
         else:
-            baseline = 0.35 * audio + 0.65 * visual
+            baseline = 0.25 * audio + 0.55 * visual + 0.20 * signal
         # Strongly demote near-static sections such as countdowns and menus.
         if visual < 0.06:
             baseline *= 0.35
@@ -558,39 +631,99 @@ def build_candidates(duration: float, energies: list[float], transcript: list[di
             index=idx, start=float(start), end=float(end),
             audio_score=audio, transcript=text[:900],
             transcript_score=ts, visual_score=visual,
-            final_score=baseline, context_before=context_before[:240], context_after=context_after[:240]
+            final_score=baseline, context_before=context_before[:240], context_after=context_after[:240],
+            loud_score=loud_peak, chat_score=chat_peak,
         ))
     return candidates
 
 
+def candidates_from_moments(moments: list[Moment], duration: float, energies: list[float],
+                            transcript: list[dict], motion: list[float], loud: list[float],
+                            chat: list[float], min_len: int, max_len: int) -> list[Candidate]:
+    """Turn LLM-picked moments into candidates with sentence-snapped, variable-length boundaries."""
+    candidates: list[Candidate] = []
+    for idx, moment in enumerate(sorted(moments, key=lambda m: m.start)):
+        start, end = snap_to_speech(moment.start, moment.end, transcript, duration, min_len, max_len)
+        a = max(0, int(start))
+        b = min(len(energies), int(math.ceil(end)))
+        local = energies[a:b] or [0.0]
+        audio = 0.55 * (sum(local) / len(local)) + 0.45 * max(local)
+        visual = _motion_score_for_range(motion, start, end)
+        loud_peak = range_peak(loud, start, end)
+        chat_peak = range_peak(chat, start, end)
+        text = transcript_for_range(transcript, start, end)
+        candidate = Candidate(
+            index=idx, start=start, end=end, audio_score=audio, transcript=text[:900],
+            transcript_score=text_score(text), visual_score=visual,
+            context_before=transcript_for_range(transcript, max(0, start - 12), start)[:240],
+            context_after=transcript_for_range(transcript, end, min(duration, end + 12))[:240],
+            origin="moment", category=moment.category, hook_title=moment.hook_title,
+            moment_score=moment.score, loud_score=loud_peak, chat_score=chat_peak,
+            reason=moment.why, social_title=moment.hook_title, social_caption=moment.post_caption,
+            hashtags=list(moment.hashtags), event_type=moment.category,
+        )
+        _score_without_vision(candidate)
+        candidates.append(candidate)
+    return candidates
+
+
+def _score_without_vision(c: Candidate) -> None:
+    """Scores used when the vision review is disabled or unavailable."""
+    signal = max(c.loud_score, c.chat_score)
+    if c.origin == "moment":
+        c.final_score = 0.75 * (c.moment_score / 100) + 0.15 * signal + 0.10 * c.visual_score
+        c.quality = c.moment_score
+    else:
+        c.final_score = 0.30 * c.audio_score + 0.55 * c.visual_score + 0.15 * signal
+        if c.visual_score < 0.06:
+            c.final_score *= 0.25
+        c.quality = -1.0
+
+
 def _rank_batch(candidates: list[Candidate], model: str, game_profile: str,
-                image_sheets: list[str], transcript_usable: bool) -> list[Candidate]:
+                image_sheets: list[str], transcript_usable: bool, creator: str = "") -> list[Candidate]:
     rows = []
     for c in candidates:
-        rows.append({
+        row = {
             "index": c.index,
             "time_range": f"{c.start:.1f}-{c.end:.1f}s",
             "audio_activity": round(c.audio_score, 3),
             "visual_motion": round(c.visual_score, 3),
+            "voice_spike": round(c.loud_score, 2),
+            "chat_spike": round(c.chat_score, 2),
             "spoken_context_before": c.context_before[:220] if transcript_usable else "",
             "spoken_context_during": c.transcript[:500] if transcript_usable else "",
             "spoken_context_after": c.context_after[:220] if transcript_usable else "",
-        })
+        }
+        if c.origin == "moment":
+            row["proposed_hook_title"] = c.hook_title
+            row["transcript_editor_note"] = c.reason[:160]
+        rows.append(row)
+    who = (f"The streamer is {creator}; name them in titles. " if creator
+           else "The streamer's name is unknown; do not invent one. ")
     prompt = (
-        f"You are a careful gaming-video editor reviewing {game_profile} footage. "
+        f"You are a harsh short-form gaming editor reviewing {game_profile} footage for YouTube Shorts / TikTok. {who}"
         "Each attached image is a 3x3 contact sheet for one candidate; its nine frames are in chronological order. "
         "Use the visual sequence AND the speech context together. Do not infer a kill, win, clutch or funny event "
         "unless visible frames or transcript support it. Judge whether the clip is a COMPLETE, standalone mini-story: "
-        "a viewer who has not watched the VOD must be able to understand the hook/setup, action/escalation, payoff, and brief reaction/aftermath. "
-        "Pure gameplay without speech can still be good, but score narrative coherence honestly. A clip that starts after the action, starts in a loading/buy/menu state, "
-        "or ends before the payoff/reaction is not publish-ready and must receive story_score <= 0.30. Do not promote an unfinished fragment merely because it is loud or high-motion. "
+        "a viewer who has not watched the VOD must understand the hook/setup, action/escalation, payoff, and reaction. "
+        "Score harshly: 0.9+ only for something that would go viral on its own, 0.7-0.89 clearly shareable, "
+        "0.5-0.69 decent, below 0.5 not worth posting. Most candidates should score below 0.7. "
+        "A clip that starts after the action, starts in a loading/buy/menu state, needs earlier context, "
+        "or ends before the payoff/reaction must receive story_score <= 0.30. Do not promote an unfinished fragment "
+        "merely because it is loud or high-motion. "
         "Reject stream starting soon screens, countdowns, menus, lobbies, character selection, loading screens, settings, "
-        "long static scenes and ordinary scoreboards. Prefer active combat, close calls, objective changes, funny failures, "
-        "impressive plays, victory/defeat, or a notable reaction. Do not invent events. "
+        "long static scenes and ordinary scoreboards. Prefer first reactions, crazy discoveries, freakouts, funny fails, "
+        "hot takes, close calls and impressive plays. Do not invent events. "
         "Return ONLY JSON matching the provided schema, with a result for every index. Scores are 0..1. "
         "screen_type must be active_gameplay, menu_lobby, starting_screen, loading_screen, scoreboard, cutscene, or other. "
-        "Rejected screen types must have score and story_score <= 0.05. Use factual reasons. social_title must be short and honest; "
-        "social_caption must be a ready-to-post, engaging 1-2 sentence description with a natural call to react; hashtags 3-5 items without #. Candidate details: " + json.dumps(rows, ensure_ascii=False)
+        "Rejected screen types must have score and story_score <= 0.05. Use factual reasons. "
+        "hook_title is the text burned on the video: max 60 characters, third person, curiosity-driven, CAPITALISE 1-3 key "
+        "words, may end with one emoji; keep proposed_hook_title if it is accurate. social_caption must be a ready-to-post "
+        "1-2 sentence description with a natural call to react; hashtags 3-5 items without #. "
+        "Name a specific game in titles, captions or hashtags only if the game profile names it; otherwise use "
+        "generic tags such as gaming, fps, clutch, funny. Candidate details: "
+        + json.dumps(rows, ensure_ascii=False)
     )
     schema = {
         "type": "object",
@@ -604,8 +737,8 @@ def _rank_batch(candidates: list[Candidate], model: str, game_profile: str,
                         "story_score": {"type": "number"}, "screen_type": {"type": "string"},
                         "event_type": {"type": "string"}, "hook": {"type": "string"},
                         "setup": {"type": "string"}, "payoff": {"type": "string"},
-                        "reason": {"type": "string"}, "social_title": {"type": "string"},
-                        "social_caption": {"type": "string"},
+                        "reason": {"type": "string"}, "hook_title": {"type": "string"},
+                        "social_title": {"type": "string"}, "social_caption": {"type": "string"},
                         "hashtags": {"type": "array", "items": {"type": "string"}},
                     },
                     "required": ["index", "score", "story_score", "screen_type", "reason"],
@@ -614,32 +747,8 @@ def _rank_batch(candidates: list[Candidate], model: str, game_profile: str,
         },
         "required": ["ranked"],
     }
-    response = requests.post(
-        f"{OLLAMA_URL}/api/chat",
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": prompt, "images": image_sheets}],
-            "stream": False,
-            "format": schema,
-            "think": False,
-            "options": {"temperature": 0.05, "num_ctx": 12288, "num_predict": 1800},
-        },
-        timeout=1800,
-    )
-    response.raise_for_status()
-    message = response.json().get("message", {})
-    raw_content = message.get("content", "") or ""
-    raw_thinking = message.get("thinking", "") or ""
-    data = None
-    errors = []
-    for raw in (raw_content, raw_thinking):
-        try:
-            data = _extract_json_object(raw)
-            break
-        except Exception as exc:
-            errors.append(str(exc))
-    if data is None:
-        raise ValueError("Ollama returned no valid structured JSON: " + " / ".join(errors))
+    data = ollama_json(OLLAMA_URL, model, prompt, schema, images=image_sheets,
+                       temperature=0.05, num_ctx=12288, num_predict=1800, timeout=1800)
     by_index = {c.index: c for c in candidates}
     result = []
     for item in data.get("ranked", []):
@@ -657,25 +766,43 @@ def _rank_batch(candidates: list[Candidate], model: str, game_profile: str,
                 score = min(score, 0.05)
                 story_score = min(story_score, 0.05)
             candidate.screen_type = screen_type
-            candidate.event_type = str(item.get("event_type", "unknown"))[:80]
+            if candidate.origin != "moment" or not candidate.event_type or candidate.event_type == "unknown":
+                candidate.event_type = str(item.get("event_type", "unknown"))[:80]
             candidate.hook = str(item.get("hook", ""))[:160]
             candidate.setup = str(item.get("setup", ""))[:180]
             candidate.payoff = str(item.get("payoff", ""))[:180]
-            candidate.reason = str(item.get("reason", "Visual AI reviewed the clip"))[:180]
-            candidate.social_title = str(item.get("social_title", ""))[:90]
-            candidate.social_caption = str(item.get("social_caption", ""))[:220]
+            vision_reason = str(item.get("reason", "Visual AI reviewed the clip"))[:180]
+            candidate.reason = (f"{candidate.reason} | {vision_reason}"[:300]
+                                if candidate.origin == "moment" and candidate.reason else vision_reason)
+            vision_title = tidy_hook_title(item.get("hook_title") or item.get("social_title") or "")
+            if vision_title and not candidate.hook_title:
+                candidate.hook_title = vision_title
+            candidate.social_title = candidate.hook_title or vision_title
+            caption = str(item.get("social_caption", "")).strip()[:260]
+            if caption:
+                candidate.social_caption = caption
             raw_tags = item.get("hashtags", [])
-            candidate.hashtags = [str(t).lstrip("#")[:40] for t in raw_tags[:5]] if isinstance(raw_tags, list) else []
+            if isinstance(raw_tags, list) and raw_tags:
+                candidate.hashtags = [str(t).lstrip("#")[:40] for t in raw_tags[:5]]
             candidate.story_score = story_score
-            if transcript_usable:
-                candidate.final_score = (0.34 * score + 0.30 * story_score +
-                                         0.16 * candidate.visual_score + 0.08 * candidate.audio_score +
-                                         0.12 * candidate.transcript_score)
+            signal = max(candidate.loud_score, candidate.chat_score)
+            vision_quality = 100 * (0.55 * score + 0.45 * story_score)
+            if candidate.origin == "moment":
+                candidate.final_score = (0.50 * candidate.moment_score / 100 + 0.20 * score + 0.15 * story_score
+                                         + 0.10 * signal + 0.05 * candidate.visual_score)
+                candidate.quality = 0.65 * candidate.moment_score + 0.35 * vision_quality
+            elif transcript_usable:
+                candidate.final_score = (0.32 * score + 0.28 * story_score + 0.14 * candidate.visual_score
+                                         + 0.06 * candidate.audio_score + 0.10 * candidate.transcript_score
+                                         + 0.10 * signal)
+                candidate.quality = vision_quality
             else:
-                candidate.final_score = (0.43 * score + 0.38 * story_score +
-                                         0.13 * candidate.visual_score + 0.06 * candidate.audio_score)
+                candidate.final_score = (0.40 * score + 0.35 * story_score + 0.12 * candidate.visual_score
+                                         + 0.05 * candidate.audio_score + 0.08 * signal)
+                candidate.quality = vision_quality
             if rejected:
                 candidate.final_score = min(candidate.final_score, 0.02)
+                candidate.quality = 0.0
             result.append(candidate)
         except (TypeError, ValueError):
             continue
@@ -690,7 +817,7 @@ def ollama_rank(candidates: list[Candidate], model: str,
                 cancel_event: Optional[threading.Event] = None,
                 log: Optional[LogCallback] = None,
                 game_profile: str = "Auto / mixed games",
-                transcript_usable: bool = False) -> list[Candidate]:
+                transcript_usable: bool = False, creator: str = "") -> list[Candidate]:
     # Broad visual shortlist; small batches reduce local context pressure and malformed responses.
     shortlist = sorted(candidates, key=lambda c: c.final_score, reverse=True)[:64]
     batch_size = 4
@@ -707,27 +834,34 @@ def ollama_rank(candidates: list[Candidate], model: str,
         if any(image is None for image in image_sheets):
             raise RuntimeError("Could not create one or more gameplay contact sheets.")
         try:
-            ranked = _rank_batch(batch, model, game_profile, image_sheets, transcript_usable)
+            ranked = _rank_batch(batch, model, game_profile, image_sheets, transcript_usable, creator)
         except Exception as first_error:
             _log(log, f"Vision batch retry with smaller candidate groups: {first_error}")
             ranked = []
             for sub_start in range(0, len(batch), 2):
                 sub = batch[sub_start:sub_start + 2]
                 sub_images = [_make_contact_sheet(frame_dir, c, cv2) for c in sub]
-                ranked.extend(_rank_batch(sub, model, game_profile, sub_images, transcript_usable))
+                ranked.extend(_rank_batch(sub, model, game_profile, sub_images, transcript_usable, creator))
         ranked_by_index.update({c.index: c for c in ranked})
         pct = batch_no / max(1, len(batches)) * 100
-        _emit(progress, "Visual story review", pct, 80 + pct * 0.08,
+        _emit(progress, "Visual story review", pct, 84 + pct * 0.04,
               f"Reviewed {min(batch_no * batch_size, len(shortlist))}/{len(shortlist)} gameplay candidates")
     return [ranked_by_index.get(c.index, c) for c in candidates]
 
 
-def choose_top(candidates: list[Candidate], count: int) -> list[Candidate]:
-    """Pick distinct, standalone stories rather than adjacent fragments of one event."""
+def choose_top(candidates: list[Candidate], count: int,
+               min_score: Optional[float] = None) -> list[Candidate]:
+    """Pick distinct, standalone stories rather than adjacent fragments of one event.
+
+    With ``min_score`` set, candidates the AI judged below that publish-readiness
+    (0-100) are dropped: fewer good clips beat more filler.
+    """
     ranked = sorted(candidates, key=lambda c: c.final_score, reverse=True)
     chosen: list[Candidate] = []
     for candidate in ranked:
         if candidate.screen_type in {"menu_lobby", "starting_screen", "loading_screen", "scoreboard"}:
+            continue
+        if min_score is not None and 0 <= candidate.quality < min_score:
             continue
         # Windows may not overlap yet still be two cuts from the same round/event.
         # Keep the best complete arc and make the next pick meaningfully independent.
@@ -769,65 +903,6 @@ def write_clip_srt(rows: list[dict], start: float, end: float, path: Path) -> bo
     return True
 
 
-def _ass_timestamp(seconds: float) -> str:
-    centiseconds = max(0, int(round(seconds * 100)))
-    hours, centiseconds = divmod(centiseconds, 360000)
-    minutes, centiseconds = divmod(centiseconds, 6000)
-    secs, centiseconds = divmod(centiseconds, 100)
-    return f"{hours}:{minutes:02}:{secs:02}.{centiseconds:02}"
-
-
-def _ass_escape(text: str) -> str:
-    return (str(text).replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
-            .replace("\n", " ").replace("\r", " "))
-
-
-def write_clip_ass(rows: list[dict], start: float, end: float, path: Path) -> bool:
-    """Write word-timed karaoke captions; punctuation-only ASR output is excluded."""
-    events = []
-    for seg in rows:
-        if seg["end"] <= start or seg["start"] >= end:
-            continue
-        word_rows = [w for w in seg.get("words", []) if w.get("word") and any(ch.isalnum() for ch in w["word"])]
-        if word_rows:
-            for offset in range(0, len(word_rows), 7):
-                group = word_rows[offset:offset + 7]
-                begin = max(0.0, float(group[0]["start"]) - start)
-                finish = min(end - start, float(group[-1]["end"]) - start)
-                if finish <= begin:
-                    continue
-                karaoke = []
-                for word in group:
-                    duration_cs = max(1, int(round((float(word["end"]) - float(word["start"])) * 100)))
-                    karaoke.append(f"{{\\k{duration_cs}}}{_ass_escape(word['word'].strip())}")
-                events.append((begin, finish, " ".join(karaoke)))
-        else:
-            text = str(seg.get("text", "")).strip()
-            if any(ch.isalnum() for ch in text):
-                events.append((max(0.0, seg["start"] - start), min(end - start, seg["end"] - start), _ass_escape(text)))
-    if not events:
-        return False
-    header = """[Script Info]
-ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
-WrapStyle: 2
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,62,&H0000D7FF,&H00FFFFFF,&H00000000,&H80000000,1,0,1,4,2,2,72,72,300,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-    with path.open("w", encoding="utf-8-sig") as f:
-        f.write(header)
-        for begin, finish, text in events:
-            f.write(f"Dialogue: 0,{_ass_timestamp(begin)},{_ass_timestamp(finish)},Default,,0,0,0,,{text}\n")
-    return True
-
-
 def _ffmpeg_filter_path(path: Path) -> str:
     value = path.resolve().as_posix()
     return value.replace(":", r"\:").replace("'", r"\'").replace(",", r"\,")
@@ -841,39 +916,53 @@ def ffmpeg_has_ass_filter() -> bool:
         return False
 
 
+def build_render_graph(plan: clip_style.LayoutPlan, duration: float, *, title: bool,
+                       ass_path: Optional[Path]) -> str:
+    """Compose layout -> hook title overlay -> captions -> soft fades into one filter graph."""
+    parts = [plan.filter]
+    current = "base"
+    if title:
+        parts.append("[1:v]format=rgba,fade=t=in:st=0.10:d=0.30:alpha=1[title]")
+        parts.append(f"[{current}][title]overlay=x=(W-w)/2:y={plan.title_center_y}-h/2:eof_action=pass[titled]")
+        current = "titled"
+    if ass_path is not None:
+        parts.append(f"[{current}]ass=filename='{_ffmpeg_filter_path(ass_path)}'[captioned]")
+        current = "captioned"
+    # A short visual ease prevents a jarring hard cut even when the source event
+    # begins or ends at an energetic moment.
+    parts.append(f"[{current}]fade=t=in:st=0:d=0.18,fade=t=out:st={max(0.0, duration - 0.22):.3f}:d=0.22,"
+                 "format=yuv420p[v]")
+    return ";".join(parts)
+
+
 def render_vertical(video: Path, candidate: Candidate, output: Path, use_nvenc: bool,
                     log: Optional[LogCallback] = None,
-                    layout: str = "Fit + blurred background",
+                    layout: str = LAYOUT_AUTO,
                     ass_path: Optional[Path] = None,
-                    normalize_audio: bool = True) -> None:
-    if layout == "Fill (center crop)":
-        video_filter = "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v]"
-    else:
-        video_filter = (
-            "[0:v]split=2[bg][fg];"
-            "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:12[blur];"
-            "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[game];"
-            "[blur][game]overlay=(W-w)/2:(H-h)/2,setsar=1[v]"
-        )
-    if ass_path and ass_path.exists():
-        video_filter = video_filter.replace("[v]", f",ass=filename='{_ffmpeg_filter_path(ass_path)}'[v]")
-    # A short visual and audio ease prevents a jarring hard cut even when the
-    # source event begins or ends at an energetic moment.
+                    normalize_audio: bool = True,
+                    plan: Optional[clip_style.LayoutPlan] = None,
+                    title_png: Optional[Path] = None) -> None:
     duration = max(0.1, candidate.end - candidate.start)
-    video_filter = video_filter.replace("[v]", f",fade=t=in:st=0:d=0.18,fade=t=out:st={max(0, duration - 0.22):.3f}:d=0.22[v]")
+    if plan is None:
+        src_w, src_h = video_dimensions(video)
+        plan = clip_style.plan_layout(layout, src_w, src_h, None, split_screen=candidate.split_screen,
+                                      band=tuple(candidate.content_band))
+    has_title = bool(title_png and title_png.exists())
+    graph = build_render_graph(plan, duration, title=has_title,
+                               ass_path=ass_path if ass_path and ass_path.exists() else None)
+    inputs = ["-ss", f"{candidate.start:.3f}", "-i", str(video)]
+    if has_title:
+        inputs += ["-loop", "1", "-framerate", "30", "-t", f"{duration:.3f}", "-i", str(title_png)]
     common = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-ss", str(candidate.start), "-i", str(video),
-        "-t", str(candidate.end - candidate.start), "-filter_complex", video_filter,
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *inputs,
+        "-t", f"{duration:.3f}", "-filter_complex", graph,
         "-map", "[v]", "-map", "0:a?", "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
     ]
-    if normalize_audio:
-        common.extend(["-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:st=0:d=0.12,afade=t=out:st={max(0, duration - 0.18):.3f}:d=0.18"])
-    else:
-        common.extend(["-af", f"afade=t=in:st=0:d=0.12,afade=t=out:st={max(0, duration - 0.18):.3f}:d=0.18"])
+    fades = f"afade=t=in:st=0:d=0.12,afade=t=out:st={max(0, duration - 0.18):.3f}:d=0.18"
+    common.extend(["-af", f"loudnorm=I=-14:TP=-1.5:LRA=11,{fades}" if normalize_audio else fades])
     if use_nvenc:
-        cmd = common + ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "21", str(output)]
+        cmd = common + ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "20", "-b:v", "0", str(output)]
         try:
             _run_process(cmd, check=True, capture_output=True, text=True)
             return
@@ -883,32 +972,63 @@ def render_vertical(video: Path, candidate: Candidate, output: Path, use_nvenc: 
             _log(log, "NVENC failed for this clip; retrying with CPU encoding.")
             if exc.stderr:
                 _log(log, exc.stderr[-1200:])
-    cmd = common + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", str(output)]
+    cmd = common + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", str(output)]
     try:
         _run_process(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
         raise _subprocess_failure(exc, "Video rendering") from exc
 
 
-def create_thumbnail(video: Path, candidate: Candidate, output: Path) -> bool:
-    midpoint = candidate.start + (candidate.end - candidate.start) * 0.55
-    result = _run_process([
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", str(midpoint),
-        "-i", str(video), "-frames:v", "1", "-q:v", "2", str(output)
-    ], check=False, capture_output=True, text=True)
+def create_thumbnail(video: Path, candidate: Candidate, output: Path,
+                     rendered: Optional[Path] = None) -> bool:
+    """Grab a preview frame; prefer the finished vertical clip so the preview matches what is posted."""
+    if rendered is not None and rendered.is_file():
+        at = max(0.0, (candidate.end - candidate.start) * 0.45)
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{at:.2f}", "-i", str(rendered),
+               "-frames:v", "1", "-vf", "scale=540:-2", "-q:v", "3", str(output)]
+    else:
+        midpoint = candidate.start + (candidate.end - candidate.start) * 0.55
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", str(midpoint),
+               "-i", str(video), "-frames:v", "1", "-q:v", "2", str(output)]
+    result = _run_process(cmd, check=False, capture_output=True, text=True)
     return result.returncode == 0 and output.exists()
 
 
-def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optional[int] = 10,
-                clip_length: Optional[int] = 35, stride: Optional[int] = 15, whisper_model: str = "small",
+def write_post_file(path: Path, candidate: Candidate) -> None:
+    tags = " ".join("#" + str(t).lstrip("#") for t in (candidate.hashtags or []))
+    lines = [candidate.hook_title or candidate.social_title or "Gaming highlight", ""]
+    if candidate.social_caption:
+        lines += [candidate.social_caption, ""]
+    if tags:
+        lines.append(tags)
+    path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
+def _transcribe_clean(audio_path: Path, model_name: str, device: str, duration: float, language_mode: str,
+                      progress, cancel_event, log):
+    rows, language = transcribe(audio_path, model_name, device, duration, progress, cancel_event, log, language_mode)
+    cleaned, stats = clean_transcript(rows, language_mode)
+    if stats["segments_dropped"] or stats["words_dropped"]:
+        _log(log, f"Transcript clean-up removed {stats['segments_dropped']} unreliable segment(s) and "
+                  f"{stats['words_dropped']} hallucinated/low-confidence word(s).")
+    return cleaned, language, transcript_quality(cleaned)
+
+
+def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optional[int] = None,
+                clip_length: Optional[int] = None, stride: Optional[int] = None, whisper_model: str = "small",
                 whisper_device: str = "cpu", ollama_model: str = DEFAULT_OLLAMA_MODEL,
                 use_ollama: bool = True, use_nvenc: bool = True,
                 game_profile: str = "Auto / mixed games",
                 cookies_browser: Optional[str] = None,
                 language_mode: str = "Mixed (English + Bengali + Hindi)",
-                render_layout: str = "Fit + blurred background",
+                render_layout: str = LAYOUT_AUTO,
                 burn_captions: bool = True,
                 normalize_audio: bool = True,
+                facecam_mode: str = FACECAM_AUTO,
+                min_score: Optional[float] = DEFAULT_MIN_SCORE,
+                creator_name: str = "",
+                burn_title: bool = True,
+                use_chat: bool = True,
                 progress: Optional[ProgressCallback] = None,
                 log: Optional[LogCallback] = None,
                 cancel_event: Optional[threading.Event] = None) -> Path:
@@ -921,8 +1041,10 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
     output_root.mkdir(parents=True, exist_ok=True)
 
     is_url = source.strip().lower().startswith(("https://", "http://"))
+    source_info: dict = {}
     if is_url:
-        video = download_youtube(source.strip(), input_dir, progress, cancel_event, log, cookies_browser)
+        video = download_youtube(source.strip(), input_dir, progress, cancel_event, log, cookies_browser,
+                                 info_out=source_info)
     else:
         video = Path(source).expanduser().resolve()
         if not video.is_file() or video.suffix.lower() not in VIDEO_EXTENSIONS:
@@ -933,15 +1055,24 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
 
     _emit(progress, "Inspecting video", 0, 10, "Reading video metadata...")
     duration = duration_seconds(video)
-    _log(log, f"Duration: {duration/60:.1f} minutes")
+    src_w, src_h = video_dimensions(video)
+    _log(log, f"Duration: {duration/60:.1f} minutes · {src_w}x{src_h}")
     auto_mode = count is None or clip_length is None or stride is None
-    # Longer windows with a dense scan give visual AI enough room to retain
-    # setup, escalation and payoff instead of selecting a single loud moment.
-    clip_length = clip_length or (45 if duration >= 90 else max(20, int(duration * 0.6)))
-    stride = stride or max(5, min(10, clip_length // 5))
-    count = count or max(3, min(10, int(round(duration / 150))))
-    if auto_mode:
-        _log(log, f"Story Auto chose {count} clips × {clip_length}s with a {stride}s scan interval.")
+    # Moments are variable length: a sentence-aligned story between min_len and max_len.
+    if clip_length:
+        max_len, min_len = int(clip_length), max(10, int(round(clip_length * 0.4)))
+    else:
+        max_len, min_len = 60, 20
+    max_len = max(10, min(max_len, int(duration)))
+    min_len = min(min_len, max_len)
+    # Fixed windows are only the fallback when there is no usable speech or no local AI.
+    window_len = clip_length or (30 if duration >= 60 else max(10, int(duration * 0.6)))
+    stride = stride or max(5, min(10, window_len // 5))
+    count = count or max(3, min(8, int(round(duration / 1200))))
+    creator = (creator_name or "").strip() or str(source_info.get("channel") or source_info.get("uploader") or "").strip()
+    _log(log, f"Up to {count} clips · {min_len}-{max_len}s moments · min score "
+              f"{'off' if min_score is None else int(min_score)}/100 · layout: {render_layout}"
+              + (f" · streamer: {creator}" if creator else ""))
     job_name = re.sub(r"[^A-Za-z0-9_-]+", "_", video.stem)[:70].strip("_") or "gaming_video"
     job_dir = output_root / job_name
     suffix = 2
@@ -958,16 +1089,16 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
         _emit(progress, "Audio extraction", 0, 11, "Extracting audio...")
         extract_audio_wav(video, wav_path)
         _check_cancel(cancel_event)
-        _emit(progress, "Audio analysis", 65, 13, "Measuring audio activity...")
-        energies = audio_energy_by_second(wav_path)
+        _emit(progress, "Audio analysis", 65, 13, "Measuring audio activity and loudness spikes...")
+        raw_rms = audio_energy_by_second(wav_path, raw=True)
+        energies = normalise_energy(raw_rms)
+        loud = loudness_spikes(raw_rms)
+        _log(log, f"Loudness spikes: {sum(1 for v in loud if v >= 0.5)} second(s) clearly above the local baseline.")
         _emit(progress, "Audio analysis", 100, 15, "Audio analysis complete")
 
         _log(log, f"Transcribing with faster-whisper ({whisper_model}, {whisper_device}); {language_mode}...")
-        transcript, language = transcribe(
-            wav_path, whisper_model, whisper_device, duration,
-            progress, cancel_event, log, language_mode
-        )
-        quality = transcript_quality(transcript)
+        transcript, language, quality = _transcribe_clean(
+            wav_path, whisper_model, whisper_device, duration, language_mode, progress, cancel_event, log)
         selected_audio_path = wav_path
 
         # Check individual stereo channels if a mixed-down track produced punctuation/no speech.
@@ -979,15 +1110,15 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
                 channel_path = Path(temp) / f"audio_{channel.lower()}.wav"
                 try:
                     extract_channel_wav(video, channel_path, channel)
-                    channel_rows, channel_language = transcribe(
-                        channel_path, whisper_model, whisper_device, duration,
-                        progress, cancel_event, log, language_mode
-                    )
-                    channel_quality = transcript_quality(channel_rows)
+                    channel_rows, channel_language, channel_quality = _transcribe_clean(
+                        channel_path, whisper_model, whisper_device, duration, language_mode,
+                        progress, cancel_event, log)
                     channel_candidates.append((channel_rows, channel_language, channel_quality, channel_path))
                     _log(log, f"{channel} channel: {channel_quality['word_count']} word tokens.")
                     if channel_quality["usable"]:
                         break
+                except JobCancelled:
+                    raise
                 except Exception as exc:
                     _log(log, f"Could not transcribe {channel} channel: {exc}")
             transcript, language, quality, selected_audio_path = max(
@@ -1002,11 +1133,9 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
                 f"{quality['alphanumeric_characters']} alphanumeric characters). "
                 "Retrying Whisper medium with per-segment mixed-language detection."
             ))
-            retry_rows, retry_language = transcribe(
-                selected_audio_path, "medium", whisper_device, duration,
-                progress, cancel_event, log, language_mode
-            )
-            retry_quality = transcript_quality(retry_rows)
+            retry_rows, retry_language, retry_quality = _transcribe_clean(
+                selected_audio_path, "medium", whisper_device, duration, language_mode,
+                progress, cancel_event, log)
             if (retry_quality["usable"], retry_quality["word_count"]) > (quality["usable"], quality["word_count"]):
                 transcript, language, quality = retry_rows, retry_language, retry_quality
             if quality["usable"]:
@@ -1034,45 +1163,130 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
         ))
     _check_cancel(cancel_event)
 
+    # Live-chat velocity (YouTube live-stream replays only).
+    chat: list[float] = []
+    is_youtube = is_url and re.search(r"(^|[/.])(youtube\.com|youtu\.be)/", source.strip().lower()) is not None
+    chat_url = source.strip() if is_youtube else None
+    if not chat_url and not is_url:
+        # Files downloaded by ClipForge keep the YouTube ID in their name: "Title [VIDEOID].mp4".
+        match = YOUTUBE_ID_IN_NAME.search(video.name)
+        if match:
+            chat_url = f"https://www.youtube.com/watch?v={match.group(1)}"
+    if use_chat and chat_url:
+        _emit(progress, "Live chat", 0, 75.2, "Checking for a YouTube live-chat replay...")
+        try:
+            with tempfile.TemporaryDirectory(prefix="clipforge_chat_") as chat_dir:
+                offsets = fetch_live_chat(chat_url, Path(chat_dir), cookies_browser, log, cancel_event)
+            if offsets:
+                chat = chat_spikes(offsets, duration)
+                _log(log, f"Live-chat replay: {len(offsets)} messages; "
+                          f"{sum(1 for v in chat if v >= 0.5)} second(s) where chat sped up sharply.")
+            else:
+                _log(log, "No live-chat replay for this video (only YouTube live-stream replays have one).")
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            _log(log, f"Live-chat replay unavailable; continuing without it. Details: {str(exc)[:300]}")
+
     frame_temp_obj = tempfile.TemporaryDirectory(prefix="clipforge_frames_")
     frame_dir = Path(frame_temp_obj.name)
     motion = visual_motion_by_second(video, duration, frame_dir, progress, cancel_event, log)
-    candidates = build_candidates(duration, energies, transcript, motion,
-                                  clip_length, stride, transcript_usable)
-    _log(log, f"Generated {len(candidates)} candidate windows.")
-    _emit(progress, "Preparing candidates", 100, 80, f"Generated {len(candidates)} candidates")
+
+    facecam: Optional[Box] = None
+    if render_layout in (LAYOUT_AUTO, LAYOUT_SPLIT):
+        if facecam_mode == FACECAM_AUTO:
+            _emit(progress, "Facecam", 50, 80, "Looking for the streamer's webcam...")
+            try:
+                facecam = clip_style.detect_facecam(video, duration, src_w, src_h, frame_dir / "facecam",
+                                                    _run_process, log=lambda m: _log(log, m))
+            except Exception as exc:
+                _log(log, f"Facecam detection failed; using the no-facecam layout. Details: {exc}")
+        elif facecam_mode in clip_style.FACECAM_CORNERS:
+            facecam = clip_style.corner_facecam(facecam_mode, src_w, src_h)
+            _log(log, f"Facecam set manually: {facecam_mode} corner.")
+        if render_layout == LAYOUT_SPLIT and facecam is None:
+            _log(log, "No facecam available for the split layout; falling back to Gameplay zoom.")
+
+    candidates: list[Candidate] = []
+    if transcript_usable and use_ollama:
+        _log(log, f"Reading the transcript in 12-minute chunks for shareable moments ({ollama_model})...")
+        _emit(progress, "Finding moments", 0, 80.5, "Reading the transcript for shareable moments...")
+        try:
+            moments = pick_moments(
+                transcript, duration, loud, chat, url=OLLAMA_URL, model=ollama_model,
+                min_len=min_len, max_len=max_len, game_profile=game_profile, creator=creator,
+                on_chunk=lambda i, n, found: _emit(
+                    progress, "Finding moments", i / n * 100, 80.5 + 3.5 * i / n,
+                    f"Read transcript chunk {i}/{n} · {found} possible moments so far"),
+                log=lambda m: _log(log, m), check_cancel=lambda: _check_cancel(cancel_event),
+            )
+            _log(log, f"Transcript moment picker found {len(moments)} possible moments.")
+            candidates = candidates_from_moments(moments, duration, energies, transcript, motion, loud, chat,
+                                                 min_len, max_len)
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            _log(log, f"Transcript moment picker unavailable; falling back to scanning windows. Details: {exc}")
+    if not candidates:
+        candidates = build_candidates(duration, energies, transcript, motion, window_len, stride,
+                                      transcript_usable, loud, chat)
+        if transcript_usable:
+            # Even scanned windows should start on a sentence and finish the thought.
+            for c in candidates:
+                c.start, c.end = snap_to_speech(c.start, c.end, transcript, duration,
+                                                max(10, int(window_len * 0.6)), int(window_len * 1.3))
+                c.transcript = transcript_for_range(transcript, c.start, c.end)[:900]
+        _log(log, f"Generated {len(candidates)} scanned candidate windows.")
+    _emit(progress, "Preparing candidates", 100, 84, f"{len(candidates)} candidates")
     if not candidates:
         raise RuntimeError("No candidate clips could be generated from this video.")
 
     if use_ollama:
         try:
-            _log(log, f"Ranking candidates with local visual AI ({ollama_model})...")
+            _log(log, f"Checking candidates against the gameplay frames with local visual AI ({ollama_model})...")
             candidates = ollama_rank(
                 candidates, ollama_model, frame_dir, progress, cancel_event, log,
-                game_profile, transcript_usable
+                game_profile, transcript_usable, creator
             )
         except JobCancelled:
             raise
         except Exception as exc:
-            _log(log, f"Local visual AI ranking unavailable; using visual/audio fallback. Details: {exc}")
+            _log(log, f"Local visual AI review unavailable; using transcript/signal scores. Details: {exc}")
             for c in candidates:
-                c.final_score = 0.35 * c.audio_score + 0.65 * c.visual_score
-                if c.visual_score < 0.06:
-                    c.final_score *= 0.25
-            _emit(progress, "AI ranking", 100, 88, "Using visual/audio fallback ranking")
+                _score_without_vision(c)
+            _emit(progress, "AI ranking", 100, 88, "Using fallback ranking")
     else:
-        _log(log, "Visual AI ranking disabled; using local visual/audio scores.")
+        _log(log, "Local AI disabled; using local visual/audio/spike scores.")
         for c in candidates:
-            c.final_score = 0.35 * c.audio_score + 0.65 * c.visual_score
-            if c.visual_score < 0.06:
-                c.final_score *= 0.25
+            _score_without_vision(c)
         _emit(progress, "AI ranking", 100, 88, "Local visual/audio ranking complete")
 
-    selected = choose_top(candidates, count)
+    leaderboard = sorted(candidates, key=lambda c: c.final_score, reverse=True)
+    _log(log, f"{len(candidates)} possible moments, best first:")
+    for c in leaderboard[:12]:
+        score = f"{c.quality:3.0f}" if c.quality >= 0 else "  -"
+        _log(log, f"  {score}  {c.start/60:5.1f}m  {(c.end - c.start):4.0f}s  "
+                  f"{(c.hook_title or c.social_title or c.reason or '')[:70]}")
+    selected = choose_top(candidates, count, min_score)
+    if not selected:
+        selected = choose_top(candidates, 1)
+        if selected:
+            _log(log, f"No moment reached the minimum score of {int(min_score or 0)}; keeping the single best one so "
+                      "you can judge it. Lower 'Min score' to get more clips.")
     if not selected:
         raise RuntimeError("No clips were selected.")
-    _log(log, f"Selected {len(selected)} non-overlapping clips.")
-    _log(log, "Visual AI selection is based on sampled frames; always review clips before publishing.")
+    _log(log, f"Kept the best {len(selected)} of {len(candidates)} possible moments.")
+    _log(log, "AI selection is based on the transcript and sampled frames; always review clips before publishing.")
+
+    # Per-clip frame traits (co-op split-screen, letterbox bars) from the 1 fps analysis frames.
+    for c in selected:
+        paths = [frame_dir / f"frame_{t:06d}.jpg" for t in range(int(c.start), int(math.ceil(c.end)))]
+        try:
+            traits = clip_style.clip_frame_traits([p for p in paths if p.exists()])
+            c.split_screen = traits["split_screen"]
+            c.content_band = tuple(traits["band"])
+        except Exception as exc:  # noqa: BLE001 - styling hints are optional
+            _log(log, f"Could not inspect clip frames for layout hints: {exc}")
     frame_temp_obj.cleanup()
 
     try:
@@ -1083,51 +1297,75 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
         nvenc_available = False
     nvenc_active = bool(use_nvenc and nvenc_available)
     _log(log, "NVIDIA NVENC encoding enabled." if nvenc_active else "Using CPU video encoding.")
+    has_ass = ffmpeg_has_ass_filter()
+    caption_family = clip_style.caption_font_family()
 
     manifest = []
-    for n, candidate in enumerate(selected, 1):
-        _check_cancel(cancel_event)
-        name = f"clip_{n:02d}_{int(candidate.start):06d}s"
-        mp4 = job_dir / f"{name}.mp4"
-        srt = job_dir / f"{name}.srt"
-        ass = job_dir / f"{name}.ass"
-        thumbnail = job_dir / f"{name}.jpg"
-        _log(log, f"Rendering clip {n}/{len(selected)}: {candidate.start:.1f}s – {candidate.end:.1f}s")
-        subtitle_written = write_clip_srt(transcript, candidate.start, candidate.end, srt) if transcript_usable else False
-        ass_written = write_clip_ass(transcript, candidate.start, candidate.end, ass) if transcript_usable and burn_captions else False
-        if not subtitle_written:
-            srt.unlink(missing_ok=True)
-        if not ass_written:
-            ass.unlink(missing_ok=True)
-        burn_ass = ass if ass_written and ffmpeg_has_ass_filter() else None
-        if ass_written and burn_ass is None:
-            _log(log, "FFmpeg lacks ASS/libass support; retaining caption sidecars without burning them in.")
-        render_vertical(video, candidate, mp4, nvenc_active, log, render_layout,
-                        ass_path=burn_ass, normalize_audio=normalize_audio)
-        create_thumbnail(video, candidate, thumbnail)
-        manifest_row = {
-            **asdict(candidate),
-            "file": mp4.name,
-            "subtitle": srt.name if subtitle_written else None,
-            "ass_subtitle": ass.name if ass_written else None,
-            "thumbnail": thumbnail.name if thumbnail.exists() else None,
-            "title_suggestion": candidate.social_title or f"Gaming highlight #{n}",
-            "social_caption": candidate.social_caption,
-            "hashtags": candidate.hashtags or [],
-            "captions_burned": bool(burn_ass),
-            "posted": False,
-        }
-        manifest.append(manifest_row)
-        (job_dir / f"{name}.metadata.json").write_text(
-            json.dumps(manifest_row, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        pct = n / len(selected) * 100
-        _emit(progress, "Rendering clips", pct, 88 + pct * 0.12,
-              f"Rendered {n}/{len(selected)} clips")
+    with tempfile.TemporaryDirectory(prefix="clipforge_titles_") as title_dir:
+        for n, candidate in enumerate(selected, 1):
+            _check_cancel(cancel_event)
+            name = f"clip_{n:02d}_{int(candidate.start):06d}s"
+            mp4 = job_dir / f"{name}.mp4"
+            srt = job_dir / f"{name}.srt"
+            ass = job_dir / f"{name}.ass"
+            thumbnail = job_dir / f"{name}.jpg"
+            post_file = job_dir / f"{name}.post.txt"
+            plan = clip_style.plan_layout(render_layout, src_w, src_h, facecam,
+                                          split_screen=candidate.split_screen, band=tuple(candidate.content_band))
+            _log(log, f"Rendering clip {n}/{len(selected)}: {candidate.start:.1f}s – {candidate.end:.1f}s "
+                      f"({candidate.end - candidate.start:.0f}s, {plan.name})")
+            subtitle_written = write_clip_srt(transcript, candidate.start, candidate.end, srt) if transcript_usable else False
+            ass_written = (clip_style.write_bold_captions(transcript, candidate.start, candidate.end, ass,
+                                                          caption_y=plan.caption_y, font_family=caption_family)
+                           if transcript_usable and burn_captions else False)
+            if not subtitle_written:
+                srt.unlink(missing_ok=True)
+            if not ass_written:
+                ass.unlink(missing_ok=True)
+            burn_ass = ass if ass_written and has_ass else None
+            if ass_written and burn_ass is None:
+                _log(log, "FFmpeg lacks ASS/libass support; retaining caption sidecars without burning them in.")
+            title_png = Path(title_dir) / f"{name}.png"
+            title_size = None
+            if burn_title and candidate.hook_title:
+                try:
+                    title_size = clip_style.render_title_card(candidate.hook_title, title_png)
+                except Exception as exc:  # noqa: BLE001 - a title is never worth failing the clip
+                    _log(log, f"Could not render the hook title card: {exc}")
+            render_vertical(video, candidate, mp4, nvenc_active, log, render_layout,
+                            ass_path=burn_ass, normalize_audio=normalize_audio, plan=plan,
+                            title_png=title_png if title_size else None)
+            create_thumbnail(video, candidate, thumbnail, rendered=mp4)
+            write_post_file(post_file, candidate)
+            manifest_row = {
+                **asdict(candidate),
+                "file": mp4.name,
+                "subtitle": srt.name if subtitle_written else None,
+                "ass_subtitle": ass.name if ass_written else None,
+                "thumbnail": thumbnail.name if thumbnail.exists() else None,
+                "post_file": post_file.name,
+                "title_suggestion": candidate.hook_title or candidate.social_title or f"Gaming highlight #{n}",
+                "social_caption": candidate.social_caption,
+                "hashtags": candidate.hashtags or [],
+                "captions_burned": bool(burn_ass),
+                "title_burned": bool(title_size),
+                "layout": plan.name,
+                "facecam_box": plan.facecam.as_dict() if plan.facecam else None,
+                "posted": False,
+            }
+            manifest.append(manifest_row)
+            (job_dir / f"{name}.metadata.json").write_text(
+                json.dumps(manifest_row, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            pct = n / len(selected) * 100
+            _emit(progress, "Rendering clips", pct, 88 + pct * 0.12,
+                  f"Rendered {n}/{len(selected)} clips")
 
     (job_dir / "clips.json").write_text(json.dumps({
+        "app_version": APP_VERSION,
         "source": str(video),
         "source_input": source,
+        "creator": creator,
         "language": language,
         "transcript_quality": quality,
         "transcript_usable": transcript_usable,
@@ -1135,13 +1373,19 @@ def process_job(source: str, output_root: Path, input_dir: Path, *, count: Optio
         "story_auto": auto_mode,
         "clip_count": count,
         "clip_length": clip_length,
+        "moment_length": [min_len, max_len],
         "scan_interval": stride,
+        "min_score": min_score,
         "render_layout": render_layout,
+        "facecam_mode": facecam_mode,
+        "facecam_box": facecam.as_dict() if facecam else None,
         "burn_captions": burn_captions,
+        "burn_title": burn_title,
         "normalize_audio": normalize_audio,
+        "live_chat_used": bool(chat),
+        "candidates_considered": len(candidates),
         "clips": manifest
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     _emit(progress, "Complete", 100, 100, f"Finished: {len(selected)} clips exported")
     _log(log, f"Finished. Output folder: {job_dir}")
     return job_dir
-
