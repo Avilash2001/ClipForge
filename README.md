@@ -14,12 +14,19 @@ ClipForge is a cross-platform Python desktop app for Windows, macOS and Linux. I
 - Mixed-language transcription mode for English, Bengali and Hindi using faster-whisper's per-segment language detection.
 - Transcript-quality checks that reject punctuation-only output, plus a Medium-model retry and stereo left/right channel fallback when speech is missing from a mono downmix.
 - Visual activity analysis from sampled frames.
-- Multimodal candidate review: Ollama receives chronological 3×3 frame contact sheets plus transcript context before/during/after each candidate.
-- Story Auto mode: adaptive clip count, longer story windows and dense scanning to favor standalone setup → escalation → payoff → reaction arcs; nearby fragments of the same event are de-duplicated.
-- Non-overlapping candidate selection.
-- 9:16 output with either full-gameplay fit / blurred background or fill / center crop.
-- Optional word-timed karaoke-style ASS captions (burned in when the local FFmpeg build has libass) and SRT/ASS sidecars.
-- Audio loudness normalisation with soft in/out transitions, thumbnails, and per-clip ready-to-post social title/caption/hashtag suggestions from the local vision model.
+- Transcript-first moment picking. The local LLM reads the transcript in 12-minute chunks, with markers where the streamer got loud and where YouTube live chat sped up. It picks the moments people share (first reactions, discoveries, freakouts, funny fails, hot takes, clutch plays) and scores each one 0-100.
+- Harsh scoring. Moments that need context are thrown out, and the **Min score** setting keeps only moments that clear the bar.
+- Variable-length clips that start on a sentence (leading filler trimmed) and end after the payoff and reaction.
+- Transcript clean-up that drops hallucinated Whisper output, such as wrong-script characters, character floods, repetition loops and low-confidence words.
+- Multimodal check: Ollama reviews chronological 3×3 frame contact sheets plus transcript context to reject menus and loading screens and to confirm the moment is visible.
+- Non-overlapping, de-duplicated selection.
+- 9:16 layouts:
+  - **Auto** (default): streamer facecam on top and gameplay below when a webcam is detected, otherwise **Gameplay zoom**.
+  - **Co-op split-screen (stacked)**: detected per clip.
+  - Manual facecam corner presets, Fit + blurred background, and Fill (center crop).
+- Letterbox bars are trimmed per clip.
+- On-video hook title card and big word-by-word captions with the active word highlighted. Captions are burned in when the local FFmpeg build has libass, and SRT/ASS sidecars are also written.
+- Audio loudness normalisation with soft in/out transitions, vertical thumbnails, and per-clip ready-to-post title/caption/hashtag suggestions, also saved as `clip_NN_*.post.txt`.
 - In-app Review & Publish gallery with visual previews, one-click playback/copy-post, and a persistent Posted checkbox per clip.
 - Live progress, ETA, logs and cancellation in the GUI.
 - FFmpeg child processes are isolated from terminal close/Ctrl+C events; the GUI warns before closing during an active job.
@@ -30,6 +37,8 @@ ClipForge is a cross-platform Python desktop app for Windows, macOS and Linux. I
 - It does not guarantee detection of kills, clutches or other game-specific events in every game. It judges sampled video frames and available transcript/audio signals. Very brief events can fall between sampled frames.
 - Speech recognition can still struggle with rapid English/Bengali/Hindi code-switching, overlapping Discord voices, noisy microphones, or game audio much louder than speech. If no usable speech is present in the recording's audio stream, captions and transcript-based context are skipped.
 - Visual AI reviews contact sheets, not every frame as a human editor would.
+- Facecam auto-detection looks for a real, mostly frontal face that stays in the same place across the stream. Illustrated/VTuber avatars, cameras that are off for most of the stream, or faces turned away are not detected. Pick the facecam corner manually in those cases.
+- Live-chat spikes only exist for replays of YouTube live streams, not for normal uploads, Twitch or Kick.
 - Social titles and hashtags are suggestions, not factual guarantees.
 - Publishing to YouTube Shorts / Instagram Reels is manual. There is no automatic upload integration.
 - No copyrighted music or stock sound effects are bundled. The original game/commentary audio is preserved and can be normalised.
