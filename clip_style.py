@@ -318,6 +318,14 @@ def caption_groups(rows: list[dict], start: float, end: float, *, max_words: int
             words.append({"start": max(0.0, ws - start), "end": min(end - start, we - start),
                           "text": text, "raw": str(w.get("word", "")).strip()})
     words.sort(key=lambda w: w["start"])
+    # Whisper sometimes emits the same line twice with overlapping timestamps; overlapping
+    # words would draw two captions on top of each other, so keep only the first.
+    deduped: list[dict] = []
+    for w in words:
+        if deduped and w["start"] < deduped[-1]["end"] - 0.05:
+            continue
+        deduped.append(w)
+    words = deduped
     groups: list[list[dict]] = []
     current: list[dict] = []
     chars = 0
@@ -587,7 +595,8 @@ def clip_frame_traits(frame_paths: list[Path]) -> dict:
     import cv2
     import numpy as np
 
-    seam_votes, considered = 0, 0
+    considered = 0
+    seams: list[float] = []
     letterboxed: list[tuple[float, float]] = []
     for path in frame_paths:
         gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
@@ -604,13 +613,27 @@ def clip_frame_traits(frame_paths: list[Path]) -> dict:
             top, bottom = content[0] / h, (content[-1] + 1) / h
             if 0.04 <= top <= 0.33 or 0.67 <= bottom <= 0.96:
                 letterboxed.append((top, bottom))
-        dx = np.abs(np.diff(gray, axis=1))
-        c = w // 2 - 1
-        centre = dx[:, c - 1:c + 2].max(axis=1)
-        others = np.concatenate([dx[:, c - 6:c - 1], dx[:, c + 2:c + 7]], axis=1).max(axis=1)
-        if float(np.mean(centre > np.maximum(others * 1.5, 6.0))) >= 0.25:
-            seam_votes += 1
-    split = considered >= 3 and seam_votes / considered >= 0.5
+        seam = _find_vertical_seam(gray)
+        if seam is not None:
+            seams.append(seam)
+    # A divider counts when most frames have one. Games like A Way Out slide it around
+    # within a single clip, so a fixed crop cannot follow it:
+    #  - almost always centred  -> a true 50/50 co-op split: stack both players;
+    #  - moving or off-centre   -> report the cut that keeps the main panel clear in every
+    #    frame (the divider position closest to the middle), and crop inside that panel.
+    seam_x = None
+    split = False
+    if considered >= 3 and len(seams) / considered >= 0.5:
+        centred = sum(1 for x in seams if abs(x - 0.5) <= 0.04) / len(seams)
+        if centred >= 0.8:
+            seam_x, split = 0.5, True
+        else:
+            right = [x for x in seams if x >= 0.5]
+            left = [x for x in seams if x < 0.5]
+            if len(right) >= len(left):
+                seam_x = round(float(np.percentile(right, 10)), 3)
+            else:
+                seam_x = round(float(np.percentile(left, 90)), 3)
     band = (0.0, 1.0)
     # Trim bars only when most of the clip is letterboxed (e.g. a cutscene); a fixed crop
     # cannot follow a clip that switches between letterboxed and full-frame shots.
@@ -618,16 +641,48 @@ def clip_frame_traits(frame_paths: list[Path]) -> dict:
         top = float(np.median([t for t, _ in letterboxed]))
         bottom = float(np.median([b for _, b in letterboxed]))
         band = (top if 0.04 <= top <= 0.33 else 0.0, bottom if 0.67 <= bottom <= 0.96 else 1.0)
-    return {"split_screen": bool(split), "band": band}
+    return {"split_screen": bool(split), "band": band, "seam_x": seam_x}
+
+
+def _find_vertical_seam(gray) -> Optional[float]:
+    """Position (0..1) of a straight full-height divider in the middle half of the frame, if any.
+
+    A split-screen divider is a column where, in most rows, the brightness step is clearly
+    larger than any step a few pixels to either side.
+    """
+    import numpy as np
+
+    h, w = gray.shape[:2]
+    dx = np.abs(np.diff(gray, axis=1))
+    pad = np.pad(dx, ((0, 0), (8, 8)), mode="constant")
+    width = dx.shape[1]
+
+    def shifted(k):
+        return pad[:, 8 + k:8 + k + width]
+
+    centre = np.maximum.reduce([shifted(-1), shifted(0), shifted(1)])
+    others = np.maximum.reduce([shifted(k) for k in (-6, -5, -4, -3, -2, 2, 3, 4, 5, 6)])
+    support = np.mean(centre > np.maximum(others * 1.5, 6.0), axis=0)
+    lo, hi = int(w * 0.25), int(w * 0.75)
+    best = lo + int(np.argmax(support[lo:hi]))
+    return (best + 1) / w if support[best] >= 0.25 else None
 
 
 def plan_layout(layout: str, src_w: int, src_h: int, facecam: Optional[Box] = None, *,
-                split_screen: bool = False, band: tuple[float, float] = (0.0, 1.0)) -> LayoutPlan:
+                split_screen: bool = False, band: tuple[float, float] = (0.0, 1.0),
+                seam_x: Optional[float] = None) -> LayoutPlan:
     """Return the filter graph and overlay positions for a layout choice."""
     rows = (_even(src_h * band[0]) if band[0] > 0 else 0, _even(src_h * band[1]) if band[1] < 1 else src_h)
+    # Uneven split (e.g. one player's wide view plus a narrow second panel): keep gameplay crops
+    # inside the wider panel so the divider and the other panel never land in the middle of the clip.
+    columns = None
+    if seam_x is not None and not split_screen and 0.25 <= seam_x <= 0.75:
+        cut = _even(src_w * seam_x)
+        margin = _even(src_w * 0.012)  # the divider is located on a 320 px analysis frame
+        columns = (0, cut - margin) if seam_x >= 0.5 else (cut + margin, src_w)
     if layout in (LAYOUT_AUTO, LAYOUT_SPLIT) and facecam is not None:
         cw, ch, cx, cy = _cam_crop(facecam, OUT_W / SPLIT_TOP_H)
-        gw, gh, gx, gy = _centre_crop(src_w, src_h, OUT_W / SPLIT_BOTTOM_H, rows)
+        gw, gh, gx, gy = _centre_crop(src_w, src_h, OUT_W / SPLIT_BOTTOM_H, rows, columns)
         graph = (
             "[0:v]split=2[cam_src][game_src];"
             f"[cam_src]crop={cw}:{ch}:{cx}:{cy},scale={OUT_W}:{SPLIT_TOP_H}:flags=lanczos,setsar=1[cam];"
@@ -651,7 +706,7 @@ def plan_layout(layout: str, src_w: int, src_h: int, facecam: Optional[Box] = No
         )
         return LayoutPlan(LAYOUT_COOP, graph, title_center_y=half_h, caption_y=half_h + 330)
     if layout in (LAYOUT_AUTO, LAYOUT_SPLIT, LAYOUT_ZOOM):
-        gw, gh, gx, gy = _centre_crop(src_w, src_h, OUT_W / ZOOM_GAME_H, rows)
+        gw, gh, gx, gy = _centre_crop(src_w, src_h, OUT_W / ZOOM_GAME_H, rows, columns)
         graph = (
             "[0:v]split=2[bg_src][game_src];" + _blur_background("bg_src", "bg") + ";"
             f"[game_src]crop={gw}:{gh}:{gx}:{gy},scale={OUT_W}:{ZOOM_GAME_H}:flags=lanczos,setsar=1[game];"

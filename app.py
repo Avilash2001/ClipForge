@@ -149,9 +149,9 @@ class ClipperApp(ctk.CTk):
         self._field(settings, "Whisper model", self.whisper_var, ["tiny", "base", "small", "medium"], 0, row=3)
         self._field(settings, "Transcription device", self.device_var,
                     ["CPU (recommended for first run)", "CUDA (advanced; requires compatible CUDA libraries)"], 1, row=3)
-        self._field(settings, "Ollama model", self.ollama_var, None, 2, row=3)
-        self._field(settings, "Fallback scan interval (sec)", self.stride_var,
-                    ["Auto", "5", "10", "12", "15", "20"], 3, row=3)
+        self._field(settings, "Vision model (Ollama)", self.ollama_var, None, 2, row=3)
+        self.picker_model_var = ctk.StringVar(value="Auto")
+        self._field(settings, "Picking model (Ollama, text)", self.picker_model_var, None, 3, row=3)
         self.ollama_check = ctk.CTkCheckBox(settings, text="Use local Ollama AI (transcript moments + visual check)",
                                             variable=self.ollama_enabled, onvalue=True, offvalue=False)
         self.ollama_check.grid(row=4, column=0, columnspan=2, sticky="w", padx=16, pady=(10, 7))
@@ -185,13 +185,23 @@ class ClipperApp(ctk.CTk):
             variable=self.normalize_audio_var
         )
         self.normalize_audio_check.grid(row=7, column=2, columnspan=2, sticky="w", padx=16, pady=(4, 6))
+        self.fresh_transcript_var = ctk.BooleanVar(value=False)
+        self.fresh_transcript_check = ctk.CTkCheckBox(
+            settings, text="Re-transcribe even if this video was transcribed before",
+            variable=self.fresh_transcript_var
+        )
+        self.fresh_transcript_check.grid(row=8, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 6))
+        self._field(settings, "Fallback scan interval (sec)", self.stride_var,
+                    ["Auto", "5", "10", "12", "15", "20"], 2, row=8)
         ctk.CTkLabel(
             settings,
-            text=("The AI reads the transcript in 12-minute chunks, scores every moment 0-100 and throws out anything "
-                  "that needs context. Clips start on a sentence and end after the reaction. Min score keeps only "
-                  "moments at or above that score; leave the streamer name blank to use the YouTube channel name."),
+            text=("The AI reads the transcript in 12-minute chunks and scores moments 0-100. Finalists are then checked "
+                  "so no clip opens on a menu, loading or death screen, and a critic re-judges them side by side and "
+                  "fact-checks the titles. Min score keeps only moments at or above that score. Picking model Auto uses "
+                  "gemma4:12b when installed (ollama pull gemma4:12b), which judged clips far better than the 9B "
+                  "default. Re-runs of the same video reuse its transcript."),
             text_color="#aeb5c8", anchor="w", justify="left", wraplength=940
-        ).grid(row=8, column=0, columnspan=4, sticky="w", padx=16, pady=(4, 12))
+        ).grid(row=9, column=0, columnspan=4, sticky="w", padx=16, pady=(4, 12))
 
         # Output
         output = self._card(body, "3  ·  OUTPUT LOCATION")
@@ -403,6 +413,9 @@ class ClipperApp(ctk.CTk):
             "creator_name": self.creator_var.get().strip(),
             "burn_title": bool(self.burn_title_var.get()),
             "use_chat": bool(self.use_chat_var.get()),
+            "picker_model": (None if self.picker_model_var.get().strip().lower() in ("", "auto")
+                             else self.picker_model_var.get().strip()),
+            "use_transcript_cache": not bool(self.fresh_transcript_var.get()),
             "cookies_browser": (None if self.cookies_browser_var.get().startswith("None")
                                 else self.cookies_browser_var.get().strip().lower()),
         }
@@ -444,6 +457,7 @@ class ClipperApp(ctk.CTk):
                 burn_captions=args["burn_captions"], normalize_audio=args["normalize_audio"],
                 facecam_mode=args["facecam_mode"], min_score=args["min_score"],
                 creator_name=args["creator_name"], burn_title=args["burn_title"], use_chat=args["use_chat"],
+                picker_model=args["picker_model"], use_transcript_cache=args["use_transcript_cache"],
                 progress=report, log=log, cancel_event=self.cancel_event,
             )
             self.events.put(("done", str(result)))
@@ -485,8 +499,21 @@ class ClipperApp(ctk.CTk):
                     self.stage_bar.set(1)
                     self.percent_label.configure(text="100%")
                     self._finish_job()
-                    self._review_output()
-                    messagebox.showinfo("Clipping complete", f"Your clips were saved here:\n\n{item[1]}")
+                    try:
+                        clip_total = len(json.loads((self.current_output / "clips.json").read_text(
+                            encoding="utf-8")).get("clips", []))
+                    except (OSError, json.JSONDecodeError):
+                        clip_total = -1
+                    if clip_total == 0:
+                        self.message_label.configure(text="No moment cleared the bar; nothing was rendered.")
+                        messagebox.showinfo(
+                            "No clip-worthy moments",
+                            "The AI did not find a moment in this video that cleared the minimum score, so no "
+                            "clips were rendered.\n\nLower 'Min score' or set a stronger picking model to see more, "
+                            "and check the Live Log for the moments it considered.")
+                    else:
+                        self._review_output()
+                        messagebox.showinfo("Clipping complete", f"Your clips were saved here:\n\n{item[1]}")
                 elif kind == "cancelled":
                     self._append_log(item[1])
                     self.stage_label.configure(text="Cancelled")

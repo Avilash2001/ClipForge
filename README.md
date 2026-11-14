@@ -16,6 +16,12 @@ ClipForge is a cross-platform Python desktop app for Windows, macOS and Linux. I
 - Visual activity analysis from sampled frames.
 - Transcript-first moment picking. The local LLM reads the transcript in 12-minute chunks, with markers where the streamer got loud and where YouTube live chat sped up. It picks the moments people share (first reactions, discoveries, freakouts, funny fails, hot takes, clutch plays) and scores each one 0-100.
 - Harsh scoring. Moments that need context are thrown out, and the **Min score** setting keeps only moments that clear the bar.
+- Grounded picks: every moment must quote its payoff line from the transcript, so invented moments are dropped.
+- Finalist checks:
+  - An edge check trims clips that would open on a menu, loading or death screen.
+  - A critic re-judges the finalists side by side and fact-checks every on-video title.
+- An optional separate **Picking model**, such as a bigger Ollama text model, for better picks.
+- A transcript cache, so re-running a video with different settings skips Whisper.
 - Variable-length clips that start on a sentence (leading filler trimmed) and end after the payoff and reaction.
 - Transcript clean-up that drops hallucinated Whisper output, such as wrong-script characters, character floods, repetition loops and low-confidence words.
 - Multimodal check: Ollama reviews chronological 3×3 frame contact sheets plus transcript context to reject menus and loading screens and to confirm the moment is visible.
@@ -60,7 +66,8 @@ Internet access is required to download YouTube source videos and first-time Whi
 - 16 GB RAM is a practical minimum; 32 GB is recommended for larger videos and local vision models.
 - An NVIDIA GPU with NVENC accelerates rendering on supported systems. CPU rendering is used automatically when NVENC is unavailable.
 - The default Whisper device is CPU to avoid CUDA/cuDNN setup complexity. CUDA transcription is optional and requires a CTranslate2-compatible CUDA/cuDNN environment.
-- Model memory depends on the Ollama model/quantisation. `qwen3.5:9b` is the default; smaller Qwen3.5 vision tags can be selected in the app if memory is constrained.
+- Model memory depends on the Ollama model/quantisation. `qwen3.5:9b` is the default vision model; smaller Qwen3.5 vision tags can be selected in the app if memory is constrained.
+- **Recommended for better picks:** `ollama pull gemma4:12b` (about 8 GB). When it is installed, **Picking model: Auto** uses it to choose moments and to fact-check titles. In testing it was a much stricter and more accurate judge than the 9B default. Ollama swaps models between stages, so it does not need to fit in VRAM alongside the vision model.
 
 ## Install from GitHub
 

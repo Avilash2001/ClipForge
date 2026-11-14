@@ -193,3 +193,132 @@ def test_clean_transcript_keeps_confident_segments_in_a_low_confidence_window():
     rows = [_seg(0, "I am calling you", avg_logprob=-1.3, no_speech_prob=0.5, compression_ratio=1.4)]
     cleaned, _ = clean_transcript(rows, "Mixed")
     assert [r["text"] for r in cleaned] == ["I am calling you"]
+
+
+# --- picking v2: grounding, hard limits, edge trimming, cache --------------------------
+
+def test_snap_never_crosses_hard_limits():
+    rows = [_seg(float(i * 3), "this is a sentence here.") for i in range(20)]
+    start, end = snap_to_speech(10.0, 30.0, rows, 100, min_len=10, max_len=40, not_before=12.5, not_after=28.0)
+    assert start >= 12.5 and end <= 28.0
+
+
+def test_quote_support_detects_invented_payoffs():
+    from moments import quote_support
+
+    rows = [_seg(10.0, "oh my god he waited for it")]
+    assert quote_support("He waited for it!", rows, 9, 14) == 1.0
+    assert quote_support("the whole squad got wiped instantly", rows, 9, 14) < 0.5
+
+
+def test_edge_labels_trim_loading_start_and_drop_hopeless_clips():
+    from clipper_engine import apply_edge_labels
+
+    rows = [_seg(float(t), "we push now and he is there.") for t in range(100, 160, 3)]
+    c = Candidate(0, 100.0, 130.0, .5, "", 0)
+    labels = ["loading_or_lobby", "gameplay", "gameplay", "gameplay", "gameplay", "death_or_spectate"]
+    assert apply_edge_labels(c, labels, rows, True, 500, 15, 45) is None
+    assert c.start > 100.4          # moved past the loading screen
+    assert c.end >= 129.0           # ending on a death screen is fine (often the payoff)
+    hopeless = Candidate(1, 200.0, 230.0, .5, "", 0)
+    bad = ["menu_or_shop"] * 3 + ["loading_or_lobby"] * 3
+    assert apply_edge_labels(hopeless, bad, rows, True, 500, 15, 45) is not None
+
+
+def test_transcript_cache_key_changes_with_settings(tmp_path):
+    from clipper_engine import transcript_cache_path
+
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"x")
+    a = transcript_cache_path(video, "small", "Mixed")
+    assert a == transcript_cache_path(video, "small", "Mixed")
+    assert a != transcript_cache_path(video, "medium", "Mixed")
+    assert a != transcript_cache_path(video, "small", "English")
+
+
+def test_overlapping_duplicate_words_do_not_stack_captions(tmp_path):
+    first = _seg(1.0, "he is killing me")
+    duplicate = _seg(1.1, "he is killing me")   # same line again, overlapping in time
+    groups = cs.caption_groups([first, duplicate], 0, 5)
+    words = [w for g in groups for w in g]
+    assert [w["text"] for w in words] == ["HE", "IS", "KILLING", "ME"]
+    assert all(b["start"] >= a["end"] - 0.05 for a, b in zip(words, words[1:]))
+
+
+def test_window_frames_are_named_by_second_and_feed_motion(tmp_path):
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+    from clipper_engine import extract_window_frames, motion_from_frames
+
+    video = tmp_path / "test.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30",
+                    "-t", "40", "-pix_fmt", "yuv420p", str(video)], check=True)
+    frames = tmp_path / "frames"
+    extract_window_frames(video, [(5, 10), (8, 14), (25, 30)], frames)
+    seconds = sorted(int(p.stem.split("_")[-1]) for p in frames.glob("frame_*.jpg"))
+    assert seconds[0] == 5 and 13 <= max(s for s in seconds if s < 20) <= 14   # overlapping windows merged
+    assert any(25 <= s <= 30 for s in seconds) and not any(16 <= s <= 23 for s in seconds)
+    motion = motion_from_frames(frames, 40)
+    assert len(motion) == 40 and max(motion[6:13]) > 0 and max(motion[16:24]) == 0
+
+
+def test_seam_detection_finds_centre_and_off_centre_dividers(tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    rng = np.random.default_rng(0)
+
+    def frames(name, seam):
+        folder = tmp_path / name
+        folder.mkdir()
+        for i in range(6):
+            left = rng.integers(60, 120, (180, int(320 * seam))).astype(np.uint8)
+            right = rng.integers(150, 210, (180, 320 - int(320 * seam))).astype(np.uint8)
+            Image.fromarray(np.hstack([left, right])).save(folder / f"frame_{i:06d}.jpg")
+        return sorted(folder.glob("*.jpg"))
+
+    centre = cs.clip_frame_traits(frames("centre", 0.5))
+    assert centre["split_screen"] and abs(centre["seam_x"] - 0.5) < 0.02
+    uneven = cs.clip_frame_traits(frames("uneven", 0.65))
+    assert not uneven["split_screen"] and abs(uneven["seam_x"] - 0.65) < 0.02
+    plan = cs.plan_layout(cs.LAYOUT_AUTO, 1920, 1080, seam_x=uneven["seam_x"])
+    crop = [part for part in plan.filter.split(";") if part.startswith("[game_src]crop=")][0]
+    w, _, x, _ = (int(v) for v in crop.split("crop=")[1].split(",")[0].split(":"))
+    assert x + w <= 1920 * 0.66   # the gameplay crop stays inside the wider panel
+
+
+def test_concurrent_jobs_never_share_an_output_folder(tmp_path):
+    from clipper_engine import claim_job_dir
+
+    first = claim_job_dir(tmp_path, "stream")
+    (first / "transcript.json").write_text("{}")           # job 1 running, no clips.json yet
+    second = claim_job_dir(tmp_path, "stream")
+    assert second != first and second.name == "stream_2"
+    empty_leftover = tmp_path / "other"
+    empty_leftover.mkdir()
+    assert claim_job_dir(tmp_path, "other") == empty_leftover
+
+
+def test_moving_divider_crops_inside_the_always_visible_panel(tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    rng = np.random.default_rng(1)
+    folder = tmp_path / "moving"
+    folder.mkdir()
+    for i, seam in enumerate([0.5, 0.5, 0.65, 0.65, 0.65, 0.6, 0.6, 0.5, 0.65, 0.65]):
+        cut = int(320 * seam)
+        left = rng.integers(60, 120, (180, cut)).astype(np.uint8)
+        right = rng.integers(150, 210, (180, 320 - cut)).astype(np.uint8)
+        Image.fromarray(np.hstack([left, right])).save(folder / f"frame_{i:06d}.jpg")
+    traits = cs.clip_frame_traits(sorted(folder.glob("*.jpg")))
+    assert not traits["split_screen"] and abs(traits["seam_x"] - 0.5) < 0.02
+    plan = cs.plan_layout(cs.LAYOUT_AUTO, 1920, 1080, seam_x=traits["seam_x"])
+    crop = [part for part in plan.filter.split(";") if part.startswith("[game_src]crop=")][0]
+    w, _, x, _ = (int(v) for v in crop.split("crop=")[1].split(",")[0].split(":"))
+    assert x + w <= 962   # never crosses the leftmost divider position
