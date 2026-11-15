@@ -4,7 +4,7 @@ cd /d "%~dp0"
 title ClipForge Setup
 
 echo ================================================
-echo   ClipForge v1.3.2 - Windows Setup
+echo   ClipForge v1.7 - Windows Setup
 echo ================================================
 echo.
 echo IMPORTANT: Close all ClipForge windows and Python terminals using this folder.
@@ -80,6 +80,18 @@ echo.
 echo Installing project dependencies (pip itself will NOT be upgraded)...
 "%VENV_PY%" -m pip install --disable-pip-version-check --no-warn-script-location -r requirements.txt
 if errorlevel 1 goto failed
+
+where nvidia-smi >nul 2>nul
+if not errorlevel 1 (
+  echo.
+  echo NVIDIA GPU detected. Checking the CUDA libraries for GPU transcription...
+  "%VENV_PY%" -c "import asr, sys; ok, why = asr.cuda_status(); print(why); sys.exit(0 if ok else 1)"
+  if errorlevel 1 (
+    echo Installing CUDA 12 / cuDNN 9 runtime wheels for GPU Whisper - about 1.5 GB...
+    "%VENV_PY%" -m pip install --disable-pip-version-check --no-warn-script-location -r requirements-gpu.txt
+    if errorlevel 1 echo WARNING: GPU libraries could not be installed. Whisper will run on the CPU.
+  )
+)
 
 if not exist "input" mkdir input
 if not exist "output" mkdir output

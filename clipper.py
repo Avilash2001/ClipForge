@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import asr
 from clip_style import FACECAM_AUTO, FACECAM_OPTIONS, LAYOUT_AUTO, LAYOUTS
 from clipper_engine import APP_VERSION, DEFAULT_INPUT_DIR, DEFAULT_MIN_SCORE, DEFAULT_OUTPUT_DIR, process_job
 
@@ -29,15 +30,21 @@ def main():
                         help="Ollama text model for moment picking and the critic (default: best installed, e.g. gemma4:12b)")
     parser.add_argument("--fresh-transcript", action="store_true",
                         help="Re-run Whisper even if this video was transcribed before")
-    parser.add_argument("--whisper-model", default="small", choices=["tiny", "base", "small", "medium"])
-    parser.add_argument("--whisper-device", default="cpu", choices=["cpu", "cuda"])
-    parser.add_argument("--ollama-model", default="qwen3.5:9b")
+    parser.add_argument("--whisper-model", default=asr.AUTO, choices=asr.WHISPER_MODELS,
+                        help="Auto: large-v3 on an NVIDIA GPU, small on the CPU")
+    parser.add_argument("--whisper-device", default=asr.AUTO, choices=asr.WHISPER_DEVICES,
+                        help="Auto: the GPU when CUDA works, else the CPU (GPU failures fall back automatically)")
+    parser.add_argument("--ollama-model", default="Auto",
+                        help="Vision model for the frame review and edge check (default: best installed)")
+    parser.add_argument("--no-signals", action="store_true",
+                        help="Only use transcript moments (skip loudness/chat/motion spike windows)")
+    parser.add_argument("--full-download", action="store_true",
+                        help="URLs: download the whole video first instead of audio + clip sections")
     parser.add_argument("--no-ollama", action="store_true")
     parser.add_argument("--cpu-encode", action="store_true")
     parser.add_argument("--no-captions", action="store_true", help="Do not burn word-highlight captions")
     parser.add_argument("--no-normalize-audio", action="store_true")
-    parser.add_argument("--language-mode", default="Mixed (English + Bengali + Hindi)",
-                        choices=["Mixed (English + Bengali + Hindi)", "English", "Bengali", "Hindi"])
+    parser.add_argument("--language-mode", default=asr.MIXED, choices=asr.LANGUAGE_MODES)
     parser.add_argument("--game-profile", default="Auto / mixed games")
     parser.add_argument("--layout", default=LAYOUT_AUTO, choices=LAYOUTS)
     parser.add_argument("--cookies-browser", default=None,
@@ -57,6 +64,7 @@ def main():
         facecam_mode=args.facecam, min_score=None if args.min_score < 0 else args.min_score,
         creator_name=args.creator, burn_title=not args.no_title, use_chat=not args.no_chat,
         picker_model=args.picker_model, use_transcript_cache=not args.fresh_transcript,
+        use_signals=not args.no_signals, section_download=not args.full_download,
         progress=report, log=lambda m: print(m, flush=True)
     )
     print(f"\nDone. Clips saved to: {result}")

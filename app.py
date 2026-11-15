@@ -14,11 +14,14 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+import asr
 from clip_style import FACECAM_AUTO, FACECAM_OPTIONS, LAYOUT_AUTO, LAYOUTS
 from clipper_engine import (
-    APP_VERSION, DEFAULT_MIN_SCORE, DEFAULT_OLLAMA_MODEL, DEFAULT_INPUT_DIR, DEFAULT_OUTPUT_DIR,
-    JobCancelled, get_ollama_status, process_job, format_eta
+    APP_VERSION, AUTO, DEFAULT_MIN_SCORE, DEFAULT_INPUT_DIR, DEFAULT_OUTPUT_DIR,
+    JobCancelled, get_ollama_status, installed_ollama_models, preferred_vision_model, process_job, format_eta
 )
+
+DEVICE_CHOICES = ["Auto (GPU if available)", "GPU (NVIDIA CUDA)", "CPU"]
 from paths import LOG_DIR
 
 ctk.set_appearance_mode("dark")
@@ -94,7 +97,7 @@ class ClipperApp(ctk.CTk):
         ctk.CTkLabel(auth_row, text="YOUTUBE LOGIN BROWSER", text_color="#c7cce0",
                      anchor="w", font=ctk.CTkFont(size=11, weight="bold")).grid(
                          row=0, column=0, sticky="w", padx=(12, 10), pady=(9, 2))
-        self.cookies_browser_var = ctk.StringVar(value="Firefox")
+        self.cookies_browser_var = ctk.StringVar(value="None (anonymous)")
         self.cookies_browser_menu = ctk.CTkComboBox(
             auth_row, variable=self.cookies_browser_var,
             values=["Chrome", "Edge", "Brave", "Firefox", "Vivaldi", "Opera", "None (anonymous)"],
@@ -102,7 +105,7 @@ class ClipperApp(ctk.CTk):
         )
         self.cookies_browser_menu.grid(row=0, column=1, sticky="w", pady=(7, 2))
         ctk.CTkLabel(auth_row,
-                     text="Use the browser already signed into YouTube. Fully exit that browser before downloading.",
+                     text="Only needed if YouTube asks you to sign in: pick the browser that is signed in, and fully exit it first.",
                      text_color="#aeb5c8", anchor="w", font=ctk.CTkFont(size=10)).grid(
                          row=1, column=0, columnspan=2, sticky="w", padx=12, pady=(2, 9))
 
@@ -129,9 +132,9 @@ class ClipperApp(ctk.CTk):
         self.count_var = ctk.StringVar(value="Auto")
         self.length_var = ctk.StringVar(value="Auto")
         self.stride_var = ctk.StringVar(value="Auto")
-        self.whisper_var = ctk.StringVar(value="small")
-        self.ollama_var = ctk.StringVar(value=DEFAULT_OLLAMA_MODEL)
-        self.device_var = ctk.StringVar(value="CPU (recommended for first run)")
+        self.whisper_var = ctk.StringVar(value=asr.AUTO)
+        self.ollama_var = ctk.StringVar(value=AUTO)
+        self.device_var = ctk.StringVar(value=DEVICE_CHOICES[0])
         self.language_mode_var = ctk.StringVar(value="Mixed (English + Bengali + Hindi)")
         self.render_layout_var = ctk.StringVar(value=LAYOUT_AUTO)
         self.facecam_var = ctk.StringVar(value=FACECAM_AUTO)
@@ -146,12 +149,12 @@ class ClipperApp(ctk.CTk):
         self._field(settings, "Max clips", self.count_var, ["Auto", "3", "5", "8", "10", "15"], 1)
         self._field(settings, "Max clip length (sec)", self.length_var, ["Auto", "30", "35", "45", "60", "90"], 2)
         self._field(settings, "Min score (0-100)", self.min_score_var, ["Off", "50", "60", "70", "80"], 3)
-        self._field(settings, "Whisper model", self.whisper_var, ["tiny", "base", "small", "medium"], 0, row=3)
-        self._field(settings, "Transcription device", self.device_var,
-                    ["CPU (recommended for first run)", "CUDA (advanced; requires compatible CUDA libraries)"], 1, row=3)
-        self._field(settings, "Vision model (Ollama)", self.ollama_var, None, 2, row=3)
-        self.picker_model_var = ctk.StringVar(value="Auto")
-        self._field(settings, "Picking model (Ollama, text)", self.picker_model_var, None, 3, row=3)
+        self._field(settings, "Whisper model", self.whisper_var, asr.WHISPER_MODELS, 0, row=3)
+        self._field(settings, "Transcription device", self.device_var, DEVICE_CHOICES, 1, row=3)
+        installed = [name for name in installed_ollama_models() if name]
+        self._field(settings, "Vision model (Ollama)", self.ollama_var, [AUTO, *installed], 2, row=3)
+        self.picker_model_var = ctk.StringVar(value=AUTO)
+        self._field(settings, "Picking model (Ollama, text)", self.picker_model_var, [AUTO, *installed], 3, row=3)
         self.ollama_check = ctk.CTkCheckBox(settings, text="Use local Ollama AI (transcript moments + visual check)",
                                             variable=self.ollama_enabled, onvalue=True, offvalue=False)
         self.ollama_check.grid(row=4, column=0, columnspan=2, sticky="w", padx=16, pady=(10, 7))
@@ -193,15 +196,28 @@ class ClipperApp(ctk.CTk):
         self.fresh_transcript_check.grid(row=8, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 6))
         self._field(settings, "Fallback scan interval (sec)", self.stride_var,
                     ["Auto", "5", "10", "12", "15", "20"], 2, row=8)
+        self.use_signals_var = ctk.BooleanVar(value=True)
+        self.use_signals_check = ctk.CTkCheckBox(
+            settings, text="Also find silent moments from loudness / chat / motion spikes",
+            variable=self.use_signals_var
+        )
+        self.use_signals_check.grid(row=9, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 6))
+        self.section_download_var = ctk.BooleanVar(value=True)
+        self.section_download_check = ctk.CTkCheckBox(
+            settings, text="URLs: download audio first, then only the chosen clips in full quality",
+            variable=self.section_download_var
+        )
+        self.section_download_check.grid(row=9, column=2, columnspan=2, sticky="w", padx=16, pady=(4, 6))
         ctk.CTkLabel(
             settings,
-            text=("The AI reads the transcript in 12-minute chunks and scores moments 0-100. Finalists are then checked "
-                  "so no clip opens on a menu, loading or death screen, and a critic re-judges them side by side and "
-                  "fact-checks the titles. Min score keeps only moments at or above that score. Picking model Auto uses "
-                  "gemma4:12b when installed (ollama pull gemma4:12b), which judged clips far better than the 9B "
-                  "default. Re-runs of the same video reuse its transcript."),
+            text=("Whisper Auto uses large-v3 on an NVIDIA GPU and falls back to the CPU (small) automatically. The AI "
+                  "reads the transcript in 12-minute chunks and scores moments 0-100; loudness, live-chat and motion "
+                  "spikes add moments nobody talked about. Finalists are checked so no clip opens on a menu, loading "
+                  "or death screen, and a critic re-judges them and fact-checks every title claim. Min score keeps "
+                  "only moments at or above that score. Model Auto picks the best installed Ollama models "
+                  "(gemma4:12b when present). Re-runs of the same video reuse its transcript."),
             text_color="#aeb5c8", anchor="w", justify="left", wraplength=940
-        ).grid(row=9, column=0, columnspan=4, sticky="w", padx=16, pady=(4, 12))
+        ).grid(row=10, column=0, columnspan=4, sticky="w", padx=16, pady=(4, 12))
 
         # Output
         output = self._card(body, "3  ·  OUTPUT LOCATION")
@@ -347,7 +363,9 @@ class ClipperApp(ctk.CTk):
             pass
 
     def _refresh_status(self):
-        online, message = get_ollama_status(self.ollama_var.get().strip() or DEFAULT_OLLAMA_MODEL)
+        chosen = self.ollama_var.get().strip()
+        model = preferred_vision_model() if chosen.lower() in ("", AUTO.lower()) else chosen
+        online, message = get_ollama_status(model)
         color = "#214d3d" if online and "available" in message else "#4a3d25" if online else "#4a2d35"
         self.ollama_badge.configure(text=message, fg_color=color)
         self.after(10000, self._refresh_status)
@@ -388,10 +406,8 @@ class ClipperApp(ctk.CTk):
             messagebox.showwarning("Missing output folder", "Choose an output folder first.")
             return
         output_root = Path(output_text).expanduser()
-        whisper_device = "cuda" if self.device_var.get().startswith("CUDA") else "cpu"
-        if whisper_device == "cuda":
-            if not messagebox.askyesno("Advanced GPU transcription", "CUDA transcription requires compatible CUDA/cuDNN libraries for CTranslate2. Continue? If it fails, switch back to CPU."):
-                return
+        device_text = self.device_var.get()
+        whisper_device = "cuda" if device_text.startswith("GPU") else "cpu" if device_text.startswith("CPU") else asr.AUTO
         args = {
             "source": source,
             "output_root": output_root,
@@ -400,7 +416,7 @@ class ClipperApp(ctk.CTk):
             "stride": stride,
             "whisper_model": self.whisper_var.get(),
             "whisper_device": whisper_device,
-            "ollama_model": self.ollama_var.get().strip() or DEFAULT_OLLAMA_MODEL,
+            "ollama_model": self.ollama_var.get().strip() or AUTO,
             "use_ollama": bool(self.ollama_enabled.get()),
             "use_nvenc": bool(self.nvenc_enabled.get()),
             "game_profile": self.game_var.get(),
@@ -416,6 +432,8 @@ class ClipperApp(ctk.CTk):
             "picker_model": (None if self.picker_model_var.get().strip().lower() in ("", "auto")
                              else self.picker_model_var.get().strip()),
             "use_transcript_cache": not bool(self.fresh_transcript_var.get()),
+            "use_signals": bool(self.use_signals_var.get()),
+            "section_download": bool(self.section_download_var.get()),
             "cookies_browser": (None if self.cookies_browser_var.get().startswith("None")
                                 else self.cookies_browser_var.get().strip().lower()),
         }
@@ -458,6 +476,7 @@ class ClipperApp(ctk.CTk):
                 facecam_mode=args["facecam_mode"], min_score=args["min_score"],
                 creator_name=args["creator_name"], burn_title=args["burn_title"], use_chat=args["use_chat"],
                 picker_model=args["picker_model"], use_transcript_cache=args["use_transcript_cache"],
+                use_signals=args["use_signals"], section_download=args["section_download"],
                 progress=report, log=log, cancel_event=self.cancel_event,
             )
             self.events.put(("done", str(result)))
