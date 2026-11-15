@@ -1,0 +1,4 @@
+# Optional: CUDA 12 / cuDNN 9 runtime libraries for GPU Whisper (CTranslate2 4.x).
+# Setup installs these automatically when an NVIDIA GPU is detected (about 1.5 GB).
+nvidia-cublas-cu12>=12.4,<13
+nvidia-cudnn-cu12>=9.1,<10

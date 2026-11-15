@@ -9,19 +9,22 @@ ClipForge is a cross-platform Python desktop app for Windows, macOS and Linux. I
 ## Features
 
 - Windows, macOS and Linux source setup scripts.
-- Optional YouTube download through yt-dlp, including browser-session cookies.
+- YouTube / Twitch / Kick URLs through yt-dlp, downloaded like an editor would: the audio track and a small 240p analysis copy first, then only the chosen clips in full quality (with a full-download fallback). Browser-session cookies are supported when a site requires sign-in.
 - Local MP4/MKV/WebM/MOV/AVI input.
-- Mixed-language transcription mode for English, Bengali and Hindi using faster-whisper's per-segment language detection.
+- GPU speech recognition by default: Whisper large-v3 on an NVIDIA GPU (float16, batched), with an automatic fallback to the CPU if anything on the GPU fails. Setup installs the CUDA 12 / cuDNN 9 libraries when an NVIDIA GPU is present.
+- Mixed-language transcription for English, Bengali and Hindi: the language is chosen per speech chunk and only from those three, so Hindi is no longer written out in Urdu, Nepali or Chinese characters.
 - Transcript-quality checks that reject punctuation-only output, plus a Medium-model retry and stereo left/right channel fallback when speech is missing from a mono downmix.
 - Visual activity analysis from sampled frames.
 - Transcript-first moment picking. The local LLM reads the transcript in 12-minute chunks, with markers where the streamer got loud and where YouTube live chat sped up. It picks the moments people share (first reactions, discoveries, freakouts, funny fails, hot takes, clutch plays) and scores each one 0-100.
+- Silent moments too: loudness, live-chat and on-screen motion spikes that the transcript picker did not cover become extra candidates, which the vision model judges from the frames alone.
 - Harsh scoring. Moments that need context are thrown out, and the **Min score** setting keeps only moments that clear the bar.
 - Grounded picks: every moment must quote its payoff line from the transcript, so invented moments are dropped.
 - Finalist checks:
   - An edge check trims clips that would open on a menu, loading or death screen.
   - A critic re-judges the finalists side by side and fact-checks every on-video title.
-- An optional separate **Picking model**, such as a bigger Ollama text model, for better picks.
-- A transcript cache, so re-running a video with different settings skips Whisper.
+- **Auto** model choice per stage: the best installed Ollama models for picking, the critic, the frame review and the edge check (gemma4:12b and qwen3.5:9b when installed).
+- Literal titles: the critic splits every title into claims (who, did what, to whom, how many) and rewrites any it cannot back up. A title that still contains hype such as "the WHOLE school" or "the most ..." is removed rather than burned in.
+- A transcript cache keyed by model, device and language mode, so re-running a video with other clip settings skips Whisper (and an old CPU transcript is never reused for a GPU run).
 - Variable-length clips that start on a sentence (leading filler trimmed) and end after the payoff and reaction.
 - Transcript clean-up that drops hallucinated Whisper output, such as wrong-script characters, character floods, repetition loops and low-confidence words.
 - Multimodal check: Ollama reviews chronological 3×3 frame contact sheets plus transcript context to reject menus and loading screens and to confirm the moment is visible.
@@ -41,9 +44,9 @@ ClipForge is a cross-platform Python desktop app for Windows, macOS and Linux. I
 ## What it does not do
 
 - It does not guarantee detection of kills, clutches or other game-specific events in every game. It judges sampled video frames and available transcript/audio signals. Very brief events can fall between sampled frames.
-- Speech recognition can still struggle with rapid English/Bengali/Hindi code-switching, overlapping Discord voices, noisy microphones, or game audio much louder than speech. If no usable speech is present in the recording's audio stream, captions and transcript-based context are skipped.
+- Speech recognition can still struggle with rapid English/Bengali/Hindi code-switching inside one sentence, overlapping Discord voices, noisy microphones, or game audio much louder than speech. Whisper picks one language per speech chunk, so a Hindi sentence inside an English chunk may come out translated into English. Hindi and Bengali speech is captioned in its own script. If no usable speech is present, captions and transcript-based context are skipped.
 - Visual AI reviews contact sheets, not every frame as a human editor would.
-- Facecam auto-detection looks for a real, mostly frontal face that stays in the same place across the stream. Illustrated/VTuber avatars, cameras that are off for most of the stream, or faces turned away are not detected. Pick the facecam corner manually in those cases.
+- Facecam auto-detection looks for a real, mostly frontal face that stays in the same place across the stream (boxed webcams and green-screen cut-outs both work). Illustrated/VTuber avatars, cameras that are off for most of the stream, or faces turned away are not detected. Pick the facecam corner manually in those cases.
 - Live-chat spikes only exist for replays of YouTube live streams, not for normal uploads, Twitch or Kick.
 - Social titles and hashtags are suggestions, not factual guarantees.
 - Publishing to YouTube Shorts / Instagram Reels is manual. There is no automatic upload integration.
@@ -65,9 +68,9 @@ Internet access is required to download YouTube source videos and first-time Whi
 
 - 16 GB RAM is a practical minimum; 32 GB is recommended for larger videos and local vision models.
 - An NVIDIA GPU with NVENC accelerates rendering on supported systems. CPU rendering is used automatically when NVENC is unavailable.
-- The default Whisper device is CPU to avoid CUDA/cuDNN setup complexity. CUDA transcription is optional and requires a CTranslate2-compatible CUDA/cuDNN environment.
+- **Whisper device Auto** uses an NVIDIA GPU when the CUDA 12 / cuDNN 9 libraries load (Setup installs the `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` wheels; a `cuda-libs` folder next to the app also works), and the CPU otherwise. large-v3 needs about 6 GB of VRAM; ClipForge asks Ollama to free the GPU before transcribing. On an RTX 3060 a 3.8-hour Hindi stream took 32 minutes: 15 for the batched pass and 17 more re-decoding the stretches where it looped. On the CPU, Auto uses the `small` model.
 - Model memory depends on the Ollama model/quantisation. `qwen3.5:9b` is the default vision model; smaller Qwen3.5 vision tags can be selected in the app if memory is constrained.
-- **Recommended for better picks:** `ollama pull gemma4:12b` (about 8 GB). When it is installed, **Picking model: Auto** uses it to choose moments and to fact-check titles. In testing it was a much stricter and more accurate judge than the 9B default. Ollama swaps models between stages, so it does not need to fit in VRAM alongside the vision model.
+- **Recommended for better picks:** `ollama pull gemma4:12b` (about 8 GB) and `ollama pull qwen3.5:9b`. With both installed, **Auto** uses gemma4:12b to choose moments, review the frames and fact-check titles, and qwen3.5:9b to check the first/last frames of each clip. In testing gemma4:12b got who-did-what right where the 9B model called the streamer's own death a clutch. Ollama swaps models between stages, so they do not need to fit in VRAM together.
 
 ## Install from GitHub
 
@@ -169,9 +172,9 @@ For Fedora, Arch or other distributions, install equivalent packages for Python 
 
 1. Ensure Ollama is running and the selected vision model is present (`ollama list`).
 2. Select either a YouTube URL or a local video file. For your own VODs, local input is the most reliable route.
-3. If downloading from YouTube, select the browser in which you are signed in. Fully exit the browser before starting if yt-dlp reports a cookie database lock. Browser cookies are sensitive credentials; never export/share/commit them.
+3. Leave **YouTube login browser** on *None (anonymous)*. Only if YouTube says it needs you to sign in, pick the browser where you are signed in, and fully exit it first (yt-dlp cannot read a locked cookie database). Browser cookies are sensitive credentials; never export/share/commit them.
 4. Leave clip count, duration and scan interval on **Auto** for the best chance of coherent standalone stories. Auto adapts the number of clips, uses a longer event window, and scans more densely. Choose manual values only when you need a strict export target.
-5. Set speech language to **Mixed (English + Bengali + Hindi)** for code-switched voice chat.
+5. Leave speech language on **Mixed (English + Bengali + Hindi)** for code-switched voice chat, and Whisper model/device on **Auto**.
 6. Keep local Ollama visual AI enabled. Use `Fit + blurred background` to preserve the full HUD; use `Fill (center crop)` only when cropping game edges is acceptable.
 7. Leave **Burn in animated word-highlight captions** enabled if you want captions. Only validated speech is used. If FFmpeg lacks libass, ClipForge keeps sidecar caption files instead.
 8. Start the job and keep the GUI open. The window intentionally refuses to close while a job is active; use **Cancel job** and wait for the safe-stop message.
@@ -238,6 +241,8 @@ The workflow builds Windows, macOS and Linux artifacts and attaches them to a Gi
 - **`0xC000013A` while rendering on Windows:** FFmpeg was interrupted by a console-control/terminal shutdown event. Use the normal `Start ClipForge.bat` launcher and keep the GUI open during a job. The FFmpeg child process is launched without a console window. The normal launcher uses `pythonw`; FFmpeg is started without a console window.
 - **YouTube says sign in / bot check:** Update yt-dlp with `pip install -U "yt-dlp[default]"`, install Deno 2.3+, use a signed-in browser session, and only download content you are authorised to use.
 - **Chrome DPAPI error on Windows:** Try Firefox or Edge. Some Chrome installations protect cookies in ways yt-dlp cannot decrypt from the current user context.
+- **GPU transcription falls back to the CPU:** the log says why (usually a missing `cublas64_12.dll` / `cudnn64_9.dll`). Run `Setup.bat` again on a PC with an NVIDIA GPU, or put the CUDA 12 / cuDNN 9 DLLs in a `cuda-libs` folder in the app folder.
+- **Hindi/Bengali captions show boxes or dotted circles:** install a font that covers the script (Windows has Nirmala UI; on Linux install `fonts-noto-core`).
 - **Transcript empty or punctuation-only:** ClipForge tests the mixed-language mode, checks left/right stereo channels when available, retries Whisper Medium, and then omits transcript-based ranking/captions if speech remains unusable. This can indicate the stream recording did not include Discord/microphone audio, voice is too quiet, or speakers overlap heavily.
 - **Ollama returns invalid/empty JSON:** v1.3 requests structured JSON with thinking disabled and retries batches in smaller groups. Update Ollama and verify the model supports images. The app logs and falls back to visual/audio scoring if local vision ranking is unavailable.
 - **Model not found:** run `ollama pull qwen3.5:9b` or choose a model name shown by `ollama list`.

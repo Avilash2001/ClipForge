@@ -38,8 +38,9 @@ def test_clean_transcript_drops_foreign_script_and_floods():
         _seg(10, "अरे निकल 嗎 बेट से"),                  # CJK glyph inside Hindi
         _seg(15, "garbage words here"),                # very low word confidence
     ]
+    # v1.7: large-v3 gives real code-switched speech 0.17-0.35 confidence, so the cut-off is 0.15.
     for word in rows[3]["words"]:
-        word["probability"] = 0.25
+        word["probability"] = 0.10
     cleaned, stats = clean_transcript(rows, "Mixed (English + Bengali + Hindi)")
     texts = [r["text"] for r in cleaned]
     assert texts == ["let's go bro", "अरे निकल बेट से"]

@@ -26,6 +26,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
       - name: Compile application
-        run: python -m compileall -q app.py clipper.py clipper_engine.py clip_style.py moments.py paths.py
+        run: python -m compileall -q app.py clipper.py clipper_engine.py clip_style.py moments.py paths.py asr.py sources.py
       - name: Run tests
         run: python -m pytest -q

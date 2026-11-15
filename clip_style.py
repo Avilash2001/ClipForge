@@ -120,6 +120,48 @@ def caption_font_family() -> str:
     return "DejaVu Sans"
 
 
+# Fonts that can shape Devanagari / Bengali. The heavy Latin caption fonts have no Indic glyphs, and
+# libass's glyph-by-glyph fallback then breaks the script's shaping (vowel signs drawn on dotted
+# circles), so caption groups in these scripts switch to one of these fonts.
+INDIC_FONTS = {
+    "DEVANAGARI": [("Nirmala.ttc", "Nirmala UI"), ("Nirmala.ttf", "Nirmala UI"),
+                   ("NotoSansDevanagari-Bold.ttf", "Noto Sans Devanagari"),
+                   ("NotoSansDevanagari-Regular.ttf", "Noto Sans Devanagari"),
+                   ("Kohinoor.ttc", "Kohinoor Devanagari"), ("mangal.ttf", "Mangal")],
+    "BENGALI": [("Nirmala.ttc", "Nirmala UI"), ("Nirmala.ttf", "Nirmala UI"),
+                ("NotoSansBengali-Bold.ttf", "Noto Sans Bengali"),
+                ("NotoSansBengali-Regular.ttf", "Noto Sans Bengali"),
+                ("KohinoorBangla.ttc", "Kohinoor Bangla"), ("Vrinda.ttf", "Vrinda")],
+}
+_indic_font_cache: dict[str, Optional[str]] = {}
+
+
+def text_script(text: str) -> str:
+    """The first non-Latin script in ``text`` ("DEVANAGARI", "BENGALI", ...) or "LATIN"."""
+    import unicodedata
+
+    for ch in text:
+        if ch.isalpha():
+            name = unicodedata.name(ch, "").split(" ")[0]
+            if name and name != "LATIN":
+                return name
+    return "LATIN"
+
+
+def script_font(script: str) -> Optional[str]:
+    """An installed font family that can shape ``script``, or None (keep the default font)."""
+    if script not in INDIC_FONTS:
+        return None
+    if script not in _indic_font_cache:
+        family = None
+        for file_name, name in INDIC_FONTS[script]:
+            if find_font([file_name]):
+                family = name
+                break
+        _indic_font_cache[script] = family
+    return _indic_font_cache[script]
+
+
 # ---------------------------------------------------------------------------
 # Hook title card (rendered with Pillow, overlaid with FFmpeg - no libass needed)
 # ---------------------------------------------------------------------------
@@ -296,9 +338,21 @@ def _ass_time(seconds: float) -> str:
 
 
 def _caption_word(raw: str) -> str:
-    word = re.sub(r"^[^\w']+|[^\w']+$", "", str(raw).strip(), flags=re.UNICODE)
-    word = word.replace("\\", "").replace("{", "").replace("}", "")
-    return word.upper()
+    """Trim punctuation around a word. Letters, digits and combining marks are kept - Hindi and
+    Bengali vowel signs (e.g. the ा in रहा) are combining marks, not punctuation."""
+    import unicodedata
+
+    word = str(raw).strip().replace("\\", "").replace("{", "").replace("}", "")
+
+    def keep(ch: str) -> bool:
+        return ch == "'" or unicodedata.category(ch)[0] in ("L", "M", "N")
+
+    start, end = 0, len(word)
+    while start < end and not keep(word[start]):
+        start += 1
+    while end > start and not keep(word[end - 1]):
+        end -= 1
+    return word[start:end].upper()
 
 
 def caption_groups(rows: list[dict], start: float, end: float, *, max_words: int = 4,
@@ -313,6 +367,7 @@ def caption_groups(rows: list[dict], start: float, end: float, *, max_words: int
             if not text or not any(ch.isalnum() for ch in text):
                 continue
             ws, we = float(w["start"]), float(w["end"])
+            we = min(we, ws + 1.2)   # a stretched word must not freeze a caption on screen
             if we <= start or ws >= end:
                 continue
             words.append({"start": max(0.0, ws - start), "end": min(end - start, we - start),
@@ -335,6 +390,7 @@ def caption_groups(rows: list[dict], start: float, end: float, *, max_words: int
             or chars + 1 + len(w["text"]) > max_chars
             or w["start"] - current[-1]["end"] > max_gap
             or re.search(r"[.!?,…।]$", current[-1]["raw"])
+            or text_script(w["text"]) != text_script(current[-1]["text"])   # never mix scripts in one caption
         )
         if boundary:
             groups.append(current)
@@ -372,7 +428,11 @@ def write_bold_captions(rows: list[dict], start: float, end: float, path: Path, 
                 colour = _CAPTION_YELLOW if j == i else _CAPTION_WHITE
                 parts.append(f"{{\\c{colour}}}{other['text']}")
             pop = "\\fscx82\\fscy82\\t(0,90,\\fscx100\\fscy100)" if i == 0 else ""
-            events.append((ev_start, ev_end, f"{{\\an5\\pos({OUT_W // 2},{caption_y}){pop}}}" + " ".join(parts)))
+            font = script_font(text_script(" ".join(w["text"] for w in group)))
+            # Letter spacing makes libass shape glyph by glyph, which breaks Indic clusters.
+            font_tag = f"\\fn{font}\\fsp0" if font else ""
+            events.append((ev_start, ev_end,
+                           f"{{\\an5\\pos({OUT_W // 2},{caption_y}){font_tag}{pop}}}" + " ".join(parts)))
     header = (
         "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nWrapStyle: 0\n"
         "ScaledBorderAndShadow: yes\n\n[V4+ Styles]\n"
@@ -415,15 +475,15 @@ def _snap_side(edges, fixed_a: int, fixed_b: int, search: range, vertical: bool,
     return best_pos if best_val >= threshold else None
 
 
-def detect_facecam(video: Path, duration: float, src_w: int, src_h: int, work_dir: Path,
-                   run_process: Callable, log: Optional[Callable[[str], None]] = None,
-                   samples: int = 24) -> Optional[Box]:
+def detect_facecam(samples: list[tuple[Path, float]], src_w: int, src_h: int, work_dir: Path,
+                   run_process: Callable, log: Optional[Callable[[str], None]] = None) -> Optional[Box]:
     """Find a streamer webcam overlay: a face that stays in the same place across the stream.
 
-    Samples frames across the video, runs OpenCV's bundled frontal-face detector,
-    keeps the face cluster that is present in many frames at a fixed position, then
-    estimates the webcam box around it and snaps its sides to persistent overlay
-    borders (or the frame edge).
+    ``samples`` are (video file, time) pairs spread over the stream - across a local file, or
+    across the downloaded clip sections of a URL source. Runs OpenCV's bundled frontal-face
+    detector, keeps the face cluster that is present in many frames at a fixed position, then
+    estimates the webcam box around it and snaps its sides to persistent overlay borders (or
+    the frame edge).
     """
     import cv2
     import numpy as np
@@ -431,11 +491,10 @@ def detect_facecam(video: Path, duration: float, src_w: int, src_h: int, work_di
     work_dir.mkdir(parents=True, exist_ok=True)
     scale_w = 960
     frames = []
-    for i in range(samples):
-        t = duration * (0.04 + 0.92 * i / max(1, samples - 1))
+    for i, (video, t) in enumerate(samples):
         out = work_dir / f"cam_{i:03d}.jpg"
-        run_process(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", str(video),
-                     "-frames:v", "1", "-vf", f"scale={scale_w}:-2", "-q:v", "3", str(out)],
+        run_process(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0.0, t):.2f}",
+                     "-i", str(video), "-frames:v", "1", "-vf", f"scale={scale_w}:-2", "-q:v", "3", str(out)],
                     check=False, capture_output=True, text=True)
         image = cv2.imread(str(out), cv2.IMREAD_GRAYSCALE)
         if image is not None:
@@ -570,6 +629,27 @@ def _centre_crop(src_w: int, src_h: int, aspect: float, band: Optional[tuple[int
     return w, h, _even(x) if x > 1 else 0, _even(y) if y > 1 else 0
 
 
+def _shift_away_from(x: int, w: int, y: int, h: int, box: Box, src_w: int,
+                     columns: Optional[tuple[int, int]] = None, max_shift: float = 0.3) -> int:
+    """Slide a gameplay crop sideways so the webcam overlay is not repeated at its edge.
+
+    The webcam already fills the top band; a centred gameplay crop that still clips its corner
+    shows a sliver of the streamer at the bottom of the clip. Moves at most ``max_shift`` of the
+    crop width; a webcam in the middle of the frame is left alone.
+    """
+    if not (box.x < x + w and x < box.x + box.w and box.y < y + h and y < box.y + box.h):
+        return x
+    lo, hi = columns or (0, src_w)
+    if box.x + box.w / 2 >= src_w / 2:
+        target = box.x - w            # webcam on the right: crop must end where it starts
+    else:
+        target = box.x + box.w        # webcam on the left: crop must start where it ends
+    target = int(_clamp(target, lo, hi - w))
+    if abs(target - x) > max_shift * w:
+        return x
+    return _even(target) if target > 1 else 0
+
+
 def _cam_crop(box: Box, aspect: float) -> tuple[int, int, int, int]:
     face_cx = box.face_cx if box.face_cx is not None else box.x + box.w / 2
     face_cy = box.face_cy if box.face_cy is not None else box.y + box.h * 0.45
@@ -596,7 +676,7 @@ def clip_frame_traits(frame_paths: list[Path]) -> dict:
     import numpy as np
 
     considered = 0
-    seams: list[float] = []
+    raw_seams: list[Optional[float]] = []   # per considered frame, in time order
     letterboxed: list[tuple[float, float]] = []
     for path in frame_paths:
         gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
@@ -613,9 +693,14 @@ def clip_frame_traits(frame_paths: list[Path]) -> dict:
             top, bottom = content[0] / h, (content[-1] + 1) / h
             if 0.04 <= top <= 0.33 or 0.67 <= bottom <= 0.96:
                 letterboxed.append((top, bottom))
-        seam = _find_vertical_seam(gray)
-        if seam is not None:
-            seams.append(seam)
+        raw_seams.append(_find_vertical_seam(gray))
+    # A real divider sits at the same column in consecutive frames (even when it slides, as in
+    # A Way Out, it moves gradually). Door frames, pillars and building edges in a normal game
+    # jump around from second to second, so a frame's divider only counts if a neighbouring
+    # frame shows it within ~2 px of the 320 px analysis frame.
+    seams = [x for i, x in enumerate(raw_seams) if x is not None and any(
+        0 <= j < len(raw_seams) and raw_seams[j] is not None and abs(raw_seams[j] - x) <= 0.007
+        for j in (i - 1, i + 1))]
     # A divider counts when most frames have one. Games like A Way Out slide it around
     # within a single clip, so a fixed crop cannot follow it:
     #  - almost always centred  -> a true 50/50 co-op split: stack both players;
@@ -628,8 +713,11 @@ def clip_frame_traits(frame_paths: list[Path]) -> dict:
         if centred >= 0.8:
             seam_x, split = 0.5, True
         else:
-            right = [x for x in seams if x >= 0.5]
-            left = [x for x in seams if x < 0.5]
+            # Once a divider is established, every position seen (even a lone frame where it
+            # jumped) must stay outside the crop.
+            seen = [x for x in raw_seams if x is not None]
+            right = [x for x in seen if x >= 0.5]
+            left = [x for x in seen if x < 0.5]
             if len(right) >= len(left):
                 seam_x = round(float(np.percentile(right, 10)), 3)
             else:
@@ -683,6 +771,7 @@ def plan_layout(layout: str, src_w: int, src_h: int, facecam: Optional[Box] = No
     if layout in (LAYOUT_AUTO, LAYOUT_SPLIT) and facecam is not None:
         cw, ch, cx, cy = _cam_crop(facecam, OUT_W / SPLIT_TOP_H)
         gw, gh, gx, gy = _centre_crop(src_w, src_h, OUT_W / SPLIT_BOTTOM_H, rows, columns)
+        gx = _shift_away_from(gx, gw, gy, gh, facecam, src_w, columns)
         graph = (
             "[0:v]split=2[cam_src][game_src];"
             f"[cam_src]crop={cw}:{ch}:{cx}:{cy},scale={OUT_W}:{SPLIT_TOP_H}:flags=lanczos,setsar=1[cam];"

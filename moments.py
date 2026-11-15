@@ -57,8 +57,62 @@ def _has_foreign_script(text: str, allowed: set[str]) -> bool:
     return any(ch.isalpha() and _char_script(ch) not in allowed for ch in text)
 
 
+def _mixes_indic_scripts(word: str) -> bool:
+    """A single word spelled in two Indic scripts (e.g. Bengali + Devanagari) only comes from decode loops."""
+    scripts = {_char_script(ch) for ch in word if ch.isalpha()} - {"LATIN"}
+    return len(scripts) > 1
+
+
 def _normalise_token(word: str) -> str:
-    return re.sub(r"[^\w']+", "", str(word).lower(), flags=re.UNICODE)
+    """Lower-case word without punctuation. Combining marks are kept: Hindi/Bengali vowel signs are
+    part of the word (without them "को" and "के" would both become "क")."""
+    return "".join(ch for ch in str(word).lower()
+                   if ch == "'" or unicodedata.category(ch)[0] in ("L", "M", "N"))
+
+
+# Whisper was trained on YouTube audio and, on noise, invents the channel outro. One mention can be
+# real speech; two or more in one segment are dropped.
+OUTRO_HALLUCINATIONS = {"subscribe", "subscribed", "सब्सक्राइब", "सबस्क्राइब", "सब्स्क्राइब"}
+MAX_WORD_SECONDS = 1.2
+
+
+def _cap_word_durations(words: list[dict], limit: float = MAX_WORD_SECONDS) -> None:
+    """Batched Whisper cuts silence out before decoding; a word next to a removed pause can come back
+    stretched across it (one word "lasting" 15 s). Speech is at the word's start, so cap its end."""
+    for w in words:
+        try:
+            if float(w["end"]) - float(w["start"]) > limit:
+                w["end"] = round(float(w["start"]) + limit, 3)
+        except (KeyError, TypeError, ValueError):
+            continue
+
+
+def _drop_phrase_loops(words: list[dict], keep: int = 2) -> tuple[list[dict], int]:
+    """Collapse a 2-8 word phrase repeated back to back (e.g. "like karenge like karenge ...").
+
+    Keeps the first ``keep`` copies; a phrase needs 3+ consecutive copies to count as a loop.
+    Returns (kept words, number dropped).
+    """
+    tokens = [_normalise_token(w.get("word", "")) for w in words]
+    drop = [False] * len(words)
+    for n in (2, 3, 4, 5, 6, 7, 8):
+        i = 0
+        while i + 3 * n <= len(tokens):
+            phrase = tokens[i:i + n]
+            if not all(phrase) or len(set(phrase)) == 1:
+                i += 1
+                continue
+            copies, j = 1, i + n
+            while j + n <= len(tokens) and tokens[j:j + n] == phrase:
+                copies, j = copies + 1, j + n
+            if copies >= 3:
+                for k in range(i + keep * n, j):
+                    drop[k] = True
+                i = j
+            else:
+                i += 1
+    kept = [w for w, d in zip(words, drop) if not d]
+    return kept, len(words) - len(kept)
 
 
 def clean_transcript(rows: list[dict], language_mode: str = "Mixed") -> tuple[list[dict], dict]:
@@ -83,10 +137,17 @@ def clean_transcript(rows: list[dict], language_mode: str = "Mixed") -> tuple[li
         # decoding window, shared by every segment cut from it - so only extreme window
         # values are trusted here; per-segment judgement uses word probabilities below.
         probs = [float(w["probability"]) for w in (seg.get("words") or []) if w.get("probability") is not None]
+        mean_prob = sum(probs) / len(probs) if probs else 1.0
+        latin_only = all(_char_script(ch) == "LATIN" for ch in text if ch.isalpha())
+        # Thresholds were re-tuned on large-v3 output (v1.7): real code-switched speech that matched
+        # YouTube's own captions had mean word confidence 0.17-0.35, so only very low values are
+        # treated as invented. Whisper's compression-ratio rule is calibrated on Latin text; Hindi
+        # and Bengali in UTF-8 compress far better, so for those the loop check below decides.
         bad = (
-            (ratio is not None and ratio > 2.4)
+            (ratio is not None and ratio > (2.4 if latin_only else 4.0))
             or (avg is not None and nsp is not None and nsp > 0.8 and avg < -1.0)
-            or (len(probs) >= 3 and sum(probs) / len(probs) < 0.35)
+            or (len(probs) >= 3 and mean_prob < 0.15)
+            or (1 <= len(probs) <= 2 and mean_prob < 0.08)
             or bool(re.search(r"(.)\1{7,}", compact))
         )
         if bad:
@@ -94,28 +155,39 @@ def clean_transcript(rows: list[dict], language_mode: str = "Mixed") -> tuple[li
             continue
         words_in = seg.get("words") or []
         words_out: list[dict] = []
-        repeat_token, repeat_count = "", 0
+        repeat_token, repeat_count, repeats = "", 0, 0
         for word in words_in:
             raw = str(word.get("word", ""))
             prob = word.get("probability")
             token = _normalise_token(raw)
             drop = (
                 "�" in raw
-                or (prob is not None and prob < 0.15)
+                or (prob is not None and prob < 0.08)
                 or _has_foreign_script(raw, allowed)
+                or _mixes_indic_scripts(raw)
             )
             if token and token == repeat_token:
                 repeat_count += 1
                 if repeat_count >= 4:  # a fourth+ identical word in a row is almost always a decode loop
                     drop = True
+                    repeats += 1
             else:
                 repeat_token, repeat_count = token, 1
             if drop:
                 stats["words_dropped"] += 1
                 continue
             words_out.append(dict(word))
+        outro = [w for w in words_out if _normalise_token(w.get("word", "")) in OUTRO_HALLUCINATIONS]
+        if len(outro) >= 2:   # "subscribe subscribe ...": Whisper's YouTube-outro hallucination
+            words_out = [w for w in words_out if w not in outro]
+            stats["words_dropped"] += len(outro)
+        words_out, phrase_repeats = _drop_phrase_loops(words_out)
+        _cap_word_durations(words_out)
+        stats["words_dropped"] += phrase_repeats
+        repeats += phrase_repeats
         if words_in:
-            if not any(any(ch.isalnum() for ch in str(w.get("word", ""))) for w in words_out):
+            mostly_loop = len(words_in) >= 8 and repeats > 0.5 * len(words_in)
+            if mostly_loop or not any(any(ch.isalnum() for ch in str(w.get("word", ""))) for w in words_out):
                 stats["segments_dropped"] += 1
                 continue
             new_text = "".join(str(w.get("word", "")) for w in words_out).strip()
@@ -130,7 +202,66 @@ def clean_transcript(rows: list[dict], language_mode: str = "Mixed") -> tuple[li
         row["text"] = re.sub(r"\s+", " ", new_text)
         row["words"] = words_out
         cleaned.append(row)
+    cleaned = _drop_cross_segment_loops(cleaned, stats)
     return cleaned, stats
+
+
+def _drop_cross_segment_loops(rows: list[dict], stats: dict, max_gap: float = 3.0) -> list[dict]:
+    """Repetition loops that Whisper spreads over many tiny segments ("bye bye" x15 as 2-word lines).
+
+    Words of neighbouring segments (less than ``max_gap`` apart) are treated as one stream: a word
+    repeated more than 3 times, or a 2-8 word phrase more than twice, in a row is cut back, and
+    segments left with nothing are dropped.
+    """
+    flat: list[tuple[int, dict]] = []
+    for index, row in enumerate(rows):
+        for word in row.get("words") or []:
+            flat.append((index, word))
+    if len(flat) < 4:
+        return rows
+    drop: set[int] = set()
+    run_start = 0
+    for k in range(1, len(flat) + 1):
+        gap_break = k == len(flat) or (float(flat[k][1].get("start", 0)) - float(flat[k - 1][1].get("end", 0))) > max_gap
+        if not gap_break:
+            continue
+        run = flat[run_start:k]
+        words = [w for _, w in run]
+        tokens = [_normalise_token(w.get("word", "")) for w in words]
+        count = 0
+        for i, token in enumerate(tokens):
+            count = count + 1 if i and token and token == tokens[i - 1] else 1
+            if count > 3:
+                drop.add(id(words[i]))
+        _, removed_ids = _phrase_loop_ids(words)
+        drop.update(removed_ids)
+        # "subscribe" spread over several tiny segments is the same outro hallucination.
+        outro = [w for w, token in zip(words, tokens) if token in OUTRO_HALLUCINATIONS]
+        if len(outro) >= 2:
+            drop.update(id(w) for w in outro)
+        run_start = k
+    if not drop:
+        return rows
+    kept_rows = []
+    for row in rows:
+        words = row.get("words") or []
+        remaining = [w for w in words if id(w) not in drop]
+        stats["words_dropped"] += len(words) - len(remaining)
+        if words and not any(any(ch.isalnum() for ch in str(w.get("word", ""))) for w in remaining):
+            stats["segments_dropped"] += 1
+            continue
+        if len(remaining) != len(words):
+            row = dict(row)
+            row["words"] = remaining
+            row["text"] = re.sub(r"\s+", " ", "".join(str(w.get("word", "")) for w in remaining)).strip()
+        kept_rows.append(row)
+    return kept_rows
+
+
+def _phrase_loop_ids(words: list[dict], keep: int = 2) -> tuple[list[dict], set[int]]:
+    kept, _ = _drop_phrase_loops(words, keep)
+    kept_ids = {id(w) for w in kept}
+    return kept, {id(w) for w in words if id(w) not in kept_ids}
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +361,109 @@ def chat_spikes(offsets: list[float], duration: float, window: int = 10,
     spikes = np.clip((ratio - 1.5) / 2.0, 0.0, 1.0)
     spikes[rate < 4] = 0.0
     return spikes.round(4).tolist()
+
+
+def motion_spikes(motion: list[float], baseline_seconds: int = 121) -> list[float]:
+    """0..1 per second where on-screen change jumps well above its local baseline.
+
+    ``motion`` is the 0..1 frame-difference curve (normalised to its 95th percentile).
+    A game that is always busy does not flag every second: a spike needs a 3-second
+    average about 1.5x the rolling two-minute median, and a real absolute change.
+    """
+    import numpy as np
+
+    arr = np.asarray(motion, dtype=np.float64)
+    if arr.size < 5:
+        return [0.0] * int(arr.size)
+    short = np.convolve(arr, np.ones(3) / 3.0, mode="same")
+    baseline = _rolling_median(arr, baseline_seconds)
+    ratio = (short + 0.03) / (baseline + 0.03)
+    spikes = np.clip((ratio - 1.4) / 1.6, 0.0, 1.0)
+    spikes[short < 0.2] = 0.0
+    return spikes.round(4).tolist()
+
+
+@dataclass
+class SignalWindow:
+    """A stretch of stream picked from signals alone (no words needed): a silent clutch or fail."""
+    start: float
+    end: float
+    peak: float          # second where the combined signal peaked
+    strength: float      # 0..1 combined signal at the peak
+    loud: float = 0.0
+    chat: float = 0.0
+    motion: float = 0.0
+
+    def describe(self) -> str:
+        parts = [name for name, value in (("loudness", self.loud), ("chat", self.chat), ("motion", self.motion))
+                 if value >= 0.35]
+        return "signal spike: " + (", ".join(parts) or "combined")
+
+
+# Live-chat replay lags the action: viewers type after they see it, behind the stream delay.
+CHAT_LAG_SECONDS = 8
+
+
+def combined_signal(duration: float, loud: list[float], chat: list[float],
+                    motion_spk: Optional[list[float]] = None, chat_lag: int = CHAT_LAG_SECONDS):
+    """Per-second 0..1 "something happened here" curve plus the aligned component curves."""
+    import numpy as np
+
+    n = max(1, int(math.ceil(duration)))
+
+    def fit(values, shift: int = 0, smooth: int = 1):
+        arr = np.zeros(n, dtype=np.float64)
+        if values:
+            src = np.asarray(values[:n], dtype=np.float64)
+            arr[: src.size] = src
+        if shift:
+            arr = np.concatenate([arr[shift:], np.zeros(shift)])  # chat at t+lag belongs to t
+        if smooth > 1:
+            # A burst counts for the few seconds around it (max filter).
+            arr = np.max(np.lib.stride_tricks.sliding_window_view(
+                np.pad(arr, (smooth // 2, smooth // 2), mode="edge"), smooth), axis=1)[:n]
+        return arr
+
+    L = fit(loud, smooth=3)
+    C = fit(chat, shift=max(0, int(chat_lag)), smooth=9)
+    M = fit(motion_spk or [], smooth=3)
+    combined = 0.45 * L + 0.40 * C + 0.15 * M
+    # Two independent signals agreeing is much stronger evidence than either alone.
+    agree = ((L >= 0.5).astype(int) + (C >= 0.5).astype(int) + (M >= 0.5).astype(int)) >= 2
+    combined = np.where(agree, np.minimum(1.0, combined + 0.25), combined)
+    return combined, L, C, M
+
+
+def signal_windows(duration: float, loud: list[float], chat: list[float],
+                   motion_spk: Optional[list[float]] = None, *,
+                   exclude: Optional[list[tuple[float, float]]] = None,
+                   max_windows: Optional[int] = None, min_strength: float = 0.35,
+                   lead: float = 22.0, tail: float = 10.0, min_gap: int = 45) -> list[SignalWindow]:
+    """Turn loudness / chat / motion spikes into candidate windows for the vision review.
+
+    The window starts ``lead`` seconds before the peak (the build-up) and ends ``tail``
+    seconds after (the reaction). Windows mostly covered by ``exclude`` ranges (moments
+    the transcript picker already found) are skipped, so the two paths never duplicate.
+    """
+    combined, L, C, M = combined_signal(duration, loud, chat, motion_spk)
+    limit = max_windows if max_windows is not None else max(4, min(15, int(duration / 600) + 2))
+    excluded = list(exclude or [])
+    windows: list[SignalWindow] = []
+    for peak in spike_peaks(combined.tolist(), min_value=min_strength, min_gap=min_gap):
+        start = max(0.0, peak - lead)
+        end = min(float(duration), peak + tail)
+        if end - start < 8:
+            continue
+        covered = max((max(0.0, min(end, b) - max(start, a)) for a, b in excluded), default=0.0)
+        if covered >= 0.35 * (end - start):
+            continue
+        lo, hi = max(0, int(peak) - 2), min(len(combined), int(peak) + 3)
+        windows.append(SignalWindow(
+            start=round(start, 2), end=round(end, 2), peak=float(peak), strength=round(float(combined[peak]), 3),
+            loud=round(float(L[lo:hi].max()), 3), chat=round(float(C[lo:hi].max()), 3),
+            motion=round(float(M[lo:hi].max()), 3)))
+    windows.sort(key=lambda w: w.strength, reverse=True)
+    return sorted(windows[:limit], key=lambda w: w.start)
 
 
 def range_peak(values: list[float], start: float, end: float) -> float:
@@ -384,6 +618,31 @@ def extract_json_object(text: str) -> dict:
     raise ValueError("Ollama response did not contain a valid JSON object.")
 
 
+def salvage_json_array(text: str) -> Optional[dict]:
+    """Recover the complete items of a ``{"key": [ ... ]}`` reply that was cut off.
+
+    With structured output, gemma4 sometimes writes one or two items and then pads with
+    whitespace until it hits ``num_predict``; the JSON never closes. Every item that is
+    complete is still good.
+    """
+    match = re.match(r'\s*\{\s*"(\w+)"\s*:\s*\[', text or "")
+    if not match:
+        return None
+    decoder = json.JSONDecoder()
+    items, pos = [], match.end()
+    while True:
+        while pos < len(text) and text[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= len(text) or text[pos] != "{":
+            break
+        try:
+            item, pos = decoder.raw_decode(text, pos)
+        except json.JSONDecodeError:
+            break
+        items.append(item)
+    return {match.group(1): items} if items else None
+
+
 def ollama_json(url: str, model: str, prompt: str, schema: dict, *, images: Optional[list[str]] = None,
                 temperature: float = 0.1, num_ctx: int = 12288, num_predict: int = 1800,
                 timeout: int = 1800) -> dict:
@@ -410,6 +669,9 @@ def ollama_json(url: str, model: str, prompt: str, schema: dict, *, images: Opti
             return extract_json_object(raw)
         except Exception as exc:  # noqa: BLE001 - try the next field
             errors.append(str(exc))
+    salvaged = salvage_json_array(payload.get("content", "") or "")
+    if salvaged is not None:
+        return salvaged
     raise ValueError("Ollama returned no valid structured JSON: " + " / ".join(errors))
 
 
@@ -459,6 +721,58 @@ MOMENT_SCHEMA = {
 }
 
 
+# Titles must be literally true. Small models drift towards hype ("the WHOLE school", "the most
+# ABSURD..."); these rules are shared by the picker, the vision review and the critic.
+LITERAL_TITLE_RULES = (
+    "Titles must be LITERALLY true, not hype: every quantity and quantifier must match what is shown or said "
+    "(a group of students is not 'the WHOLE school', one enemy is not 'the whole team', two kills is not an 'ACE'; "
+    "avoid whole/entire/all/every/everyone/nobody/always/never unless literally so). Get WHO did WHAT to WHOM right: "
+    "do not credit the streamer with a teammate's or a game character's action or line, and do not turn being killed "
+    "into killing. No superlatives or rankings that cannot be checked (most, best, worst, craziest, ever, of all time, "
+    "world record). Never use he/she/his/her for the streamer or players; use the name, 'they' or the role. "
+    "If you are unsure of a detail, leave it out rather than guess."
+)
+
+# Words that make a title a factual claim worth a second look when the evidence does not contain them.
+ABSOLUTE_WORDS = {
+    "whole", "entire", "all", "every", "everyone", "everybody", "everything", "nobody", "nothing", "always",
+    "never", "most", "best", "worst", "ever", "only", "first", "last", "biggest", "craziest", "fastest",
+    "greatest", "hardest", "funniest", "wildest", "impossible", "record", "ace", "team", "squad", "lobby",
+    # Claims about how someone felt: in the final test "CARRYMINATI panics as the police arrive" was burned
+    # on a clip where he calmly asks for music. These need an audible outburst and a matching face.
+    "panics", "panic", "panicking", "freaks", "freaking", "loses", "rage", "rages", "raging", "screams",
+    "screaming", "terrified", "furious", "shocked", "meltdown", "desperate", "crazy", "insane",
+}
+GENDERED_WORDS = {"he", "him", "his", "she", "her", "hers", "himself", "herself"}
+# Pure hype: if one of these survives the fact-check without being in the evidence, the title is dropped.
+STRICT_TITLE_WORDS = {"whole", "entire", "every", "everyone", "everybody", "nobody", "always", "never", "most",
+                      "best", "worst", "ever"}
+_NOT_SUPERLATIVES = {"interest", "honest", "quest", "rest", "request", "contest", "protest", "harvest", "forest",
+                     "chest", "guest", "test", "latest", "suggest", "manifest", "invest", "arrest"}
+
+
+def title_risks(title: str, evidence: str = "", *, strict: bool = False) -> list[str]:
+    """Words in a title that make a factual claim the evidence text does not itself contain.
+
+    Default (trigger) mode flags quantifiers, superlatives (incl. "-est" words) and gendered
+    pronouns, so the title gets a literal-truth fact-check. ``strict`` mode flags only pure
+    hype words and superlatives: used as the final gate after the fact-check.
+    """
+    tokens = [_normalise_token(t) for t in re.split(r"[\s/]+", str(title or ""))]
+    tokens = [t for t in tokens if t]
+    seen = {_normalise_token(t) for t in re.split(r"[\s/]+", str(evidence or ""))}
+    risky = []
+    for token in tokens:
+        superlative = len(token) > 5 and token.endswith("est") and token not in _NOT_SUPERLATIVES
+        if strict:
+            flagged = (token in STRICT_TITLE_WORDS or superlative) and token not in seen
+        else:
+            flagged = ((token in ABSOLUTE_WORDS or superlative) and token not in seen) or token in GENDERED_WORDS
+        if flagged and token not in risky:
+            risky.append(token)
+    return risky
+
+
 def moment_prompt(lines: list[str], chunk_start: float, chunk_end: float, *, min_len: int, max_len: int,
                   game_profile: str, creator: str) -> str:
     who = (f"The streamer is {creator}. Name them in hook titles (e.g. '{creator.split()[0].upper()} can't believe...')."
@@ -490,8 +804,8 @@ def moment_prompt(lines: list[str], chunk_start: float, chunk_end: float, *, min
         "- hook_title: the text shown on the video. Max 60 characters, third person, present tense, curiosity-driven. "
         "Write it in normal sentence case and put ONLY 1-3 key words in CAPITALS (never the whole title). May end with "
         "one emoji. Good: \"TIM can't believe who's STREAMING inside GTA 6 💀\", \"Squad gets SNIPED through a wall 😭\". "
-        "Bad: \"SQUAD GETS SNIPED THROUGH A WALL\". Only claim what the transcript proves: if one player dies, do not say "
-        "the whole squad died. Write it in English even if the speech is Hindi or Bengali.\n"
+        "Bad: \"SQUAD GETS SNIPED THROUGH A WALL\". Write it in English even if the speech is Hindi or Bengali. "
+        + LITERAL_TITLE_RULES + "\n"
         "- post_caption: one or two ready-to-post sentences ending with a question or call to react. hashtags: 3-5, no #. "
         "Name a specific game only if the Game line above names it; otherwise use generic tags (gaming, fps, funny...).\n"
         "- why: one short factual sentence saying what happens.\n\n"
@@ -593,7 +907,7 @@ def pick_moments(rows: list[dict], duration: float, loud: list[float], chat: lis
                                game_profile=game_profile, creator=creator)
         try:
             data = ollama_json(url, model, prompt, MOMENT_SCHEMA, temperature=0.2,
-                               num_ctx=16384, num_predict=1400, timeout=900)
+                               num_ctx=16384, num_predict=2400, timeout=900)
         except Exception as exc:  # noqa: BLE001 - one bad chunk should not sink the job
             failures += 1
             if log:
@@ -645,6 +959,19 @@ def pick_moments(rows: list[dict], duration: float, loud: list[float], chat: lis
 # Critic pass: re-judge the finalists side by side
 # ---------------------------------------------------------------------------
 
+CLAIMS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "claim": {"type": "string"},
+            "evidence": {"type": "string"},
+            "literally_true": {"type": "boolean"},
+        },
+        "required": ["claim", "evidence", "literally_true"],
+    },
+}
+
 CRITIC_SCHEMA = {
     "type": "object",
     "properties": {
@@ -654,56 +981,173 @@ CRITIC_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "index": {"type": "integer"},
+                    "frames_show": {"type": "string"},
                     "what_happens": {"type": "string"},
+                    "event_visible": {"type": "boolean"},
+                    "clear_reaction": {"type": "boolean"},
+                    "standalone": {"type": "boolean"},
+                    "payoff": {"type": "boolean"},
                     "stranger_score": {"type": "integer"},
+                    "title_claims": CLAIMS_SCHEMA,
                     "title_supported": {"type": "boolean"},
                     "fixed_title": {"type": "string"},
                     "keep": {"type": "boolean"},
                     "reason": {"type": "string"},
                 },
-                "required": ["index", "what_happens", "stranger_score", "title_supported", "fixed_title", "keep", "reason"],
+                "required": ["index", "frames_show", "what_happens", "event_visible", "clear_reaction", "standalone",
+                             "payoff", "stranger_score", "title_claims", "title_supported", "fixed_title", "keep",
+                             "reason"],
             },
         }
     },
     "required": ["verdicts"],
 }
 
+STORY_GAME_NOTE = (
+    "In story games much of the speech is the game's own characters (cutscene dialogue), not the streamer. Only "
+    "credit words or reactions to the streamer when it is clearly them (commentary, reactions, talking to "
+    "teammates); for a cutscene moment, title the scene itself, e.g. 'Bank heist goes WRONG in the first minute'. "
+    "A title that credits the streamer with a game character's line is NOT supported."
+)
 
-def critic_prompt(items: list[dict], game_profile: str, creator: str) -> str:
+
+FRAMES_NOTE = (
+    "Each clip also has an attached image: a 3x3 contact sheet of its frames in time order (images are in the "
+    "same order as the clips). LOOK at it. frames_summary was written by another model and can be wrong; when "
+    "it disagrees with what you see, trust the frames. A claim about an action (caught, killed, crashed, "
+    "exploded) is true only if the frames or the speech show it. The streamer's webcam is in the frames: use "
+    "their face to judge claims about their reaction (laughing is not panicking)."
+)
+
+
+def critic_prompt(items: list[dict], game_profile: str, creator: str, with_frames: bool = False) -> str:
     who = f"The streamer is {creator}. " if creator else ""
     return (
         "You are the final reviewer for a gaming Shorts channel. A first pass already picked these candidate clips "
         f"from a {game_profile} stream. {who}Re-judge them side by side, harshly, as a STRANGER scrolling Shorts who "
         "has never seen this streamer.\n"
+        "key_line, when present, is the line in the speech where the first pass heard the payoff - verbatim "
+        "speech, so translate it and use it as evidence, but judge for yourself whether it is a real payoff.\n"
         "For each clip:\n"
-        "- what_happens: in one plain sentence, what actually happens in the clip (from the speech and the frame "
-        "summary). If you cannot say, write 'nothing clear'.\n"
+        "- frames_show: (only when images are attached, else write 'no frames') first describe ONLY what you "
+        "see in the 9 frames, in order: the place, what the characters are doing, any visible event, and the "
+        "streamer's face in the webcam (smiling, shouting, calm). No guessing from the title.\n"
+        "- what_happens: in one plain, literal sentence, what actually happens in the clip (from the speech and the "
+        "frames or frame summary): who does what to whom, and how many. If you cannot say, write 'nothing clear'.\n"
         "- stranger_score 0-100: would a stranger stop scrolling and watch to the end? Something must HAPPEN with a "
         "clear payoff (a death, kill, clutch, fail, surprise, rage, a line that is funny on its own). Talk about "
         "settings, graphics, skins, audio/mic, ping, buying weapons, menus, planning without an outcome, inside jokes, "
         "or people repeating a word scores below 35. 'nothing clear' scores below 20.\n"
-        "- title_supported: is every claim in the title backed by the speech or frame summary? (e.g. a title saying "
-        "'the whole squad' died when one player died is NOT supported).\n"
-        "- fixed_title: ALWAYS fill it. If the title is supported, repeat it; if not, write an accurate replacement "
-        "that describes what_happens in the same style (sentence case, 1-3 CAPS words, "
-        "optional emoji, max 60 characters); otherwise repeat the title.\n"
+        "- title_claims: split the title into every factual claim it makes: WHO (which person or character), DID "
+        "WHAT, TO WHOM, HOW MANY / HOW MUCH (any quantifier or number: whole, entire, all, every, squad, team, two, "
+        "ace...), and any superlative or judgement (most, best, worst, craziest, ever, insane, brutal, loses it). For "
+        "each, quote the evidence from speech_in_clip or frames_summary and set literally_true. It is true only if "
+        "the evidence states or plainly shows exactly that: 'a group of NPCs' does NOT support 'the WHOLE school'; "
+        "one teammate dying does NOT support 'the whole squad'; the streamer being killed does NOT support the "
+        "streamer killing. A superlative or ranking ('the most ABSURD', 'the craziest') can never be checked, so it "
+        "is false. A big reaction ('freaks out', 'loses it') needs an audible outburst in the speech (shouting, "
+        "swearing, [LOUD]). A he/she/his/her pronoun for the streamer or a player is false (their gender is not "
+        "given).\n"
+        "- title_supported: true only if EVERY claim is literally_true.\n"
+        "- fixed_title: ALWAYS fill it. If the title is supported, repeat it exactly. If not, write the most "
+        "literal version that keeps the hook: drop or correct each false claim (e.g. 'Avixion gets ambushed by "
+        "the WHOLE school' -> 'Avixion gets JUMPED by a gang of students'). Same style: sentence case, 1-3 CAPS "
+        "words, optional emoji, max 60 characters, English.\n"
+        "- Four yes/no checks, answered strictly:\n"
+        "  event_visible: something visibly HAPPENS in the frames - a fight, kill, death, crash, explosion, chase, "
+        "fall, big reveal - not just walking, driving, standing, talking or menus.\n"
+        "  clear_reaction: the streamer clearly reacts to it - big laugh, shout, shock, rage - in the speech or "
+        "on their face in the webcam. Calm commentary is false.\n"
+        "  standalone: a stranger understands the setup without earlier context or knowing the people.\n"
+        "  payoff: the clip lands something by the end - the event resolves or a punchline hits.\n"
         "- keep: true only if you would actually post it.\n"
-        "In story games much of the speech is the game's own characters (cutscene dialogue), not the streamer. Only credit words or reactions to the streamer when it is clearly them (commentary, reactions, talking to teammates); for a cutscene moment, title the scene itself, e.g. 'Bank heist goes WRONG in the first minute'. A title that credits the streamer with a game character's line is NOT supported.\n"
+        + STORY_GAME_NOTE + "\n" + LITERAL_TITLE_RULES + "\n"
+        + (FRAMES_NOTE + "\n" if with_frames else "") +
         "Compare the clips with each other; be consistent. Return a verdict for every index.\n\n"
         "Clips:\n" + json.dumps(items, ensure_ascii=False, indent=1)
     )
 
 
+VERIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "titles": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "claims": CLAIMS_SCHEMA,
+                    "literal_title": {"type": "string"},
+                },
+                "required": ["index", "claims", "literal_title"],
+            },
+        }
+    },
+    "required": ["titles"],
+}
+
+
+def verify_prompt(items: list[dict], creator: str, with_frames: bool = False) -> str:
+    who = f"The streamer is {creator}. " if creator else ""
+    return (
+        "You are a fact-checker for gaming Shorts titles. " + who +
+        "For each title, list its factual claims (who, did what, to whom, how many, any superlative or judgement) "
+        "with the evidence quoted from 'evidence', and mark each literally_true. Words flagged in 'check_words' "
+        "need special care: keep them only if the evidence literally supports them. A word about how someone felt "
+        "(panics, freaks out, loses it, rage, screams, shocked, desperate) is true only if the speech has a real "
+        "outburst (shouting, swearing, repeated exclamations) AND, when frames are attached, the streamer's face "
+        "matches - a smiling or calm streamer is not panicking; use a neutral verb such as 'reacts'. 'Crazy' or "
+        "'insane' needs the speech to say it or the frames to show something extraordinary. Then write "
+        "literal_title: the "
+        "title with every unsupported claim removed or corrected, keeping the hook and style (sentence case, 1-3 "
+        "CAPS words, optional emoji, max 60 characters). If the title is already literally true, repeat it "
+        "exactly.\n" + LITERAL_TITLE_RULES + "\n" + (FRAMES_NOTE + "\n" if with_frames else "")
+        + "\nTitles:\n" + json.dumps(items, ensure_ascii=False, indent=1)
+    )
+
+
+RUBRIC_WEIGHTS = {"event_visible": 30, "clear_reaction": 25, "standalone": 20, "payoff": 25}
+
+
+def rubric_score(verdict: dict) -> float:
+    """0-100 from the critic's four yes/no checks."""
+    return float(sum(weight for key, weight in RUBRIC_WEIGHTS.items() if bool(verdict.get(key, False))))
+
+
+def _claims(raw) -> list[dict]:
+    claims = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, dict) and str(item.get("claim", "")).strip():
+            claims.append({"claim": str(item.get("claim", "")).strip()[:120],
+                           "evidence": str(item.get("evidence", "")).strip()[:160],
+                           "literally_true": bool(item.get("literally_true", False))})
+    return claims
+
+
 def critique(items: list[dict], *, url: str, model: str, game_profile: str = "Auto / mixed games",
              creator: str = "", log: Optional[Callable[[str], None]] = None,
-             batch_size: int = 6) -> dict[int, dict]:
-    """Ask the text model to re-judge finalists. Returns {index: verdict}; missing indexes were not judged."""
+             batch_size: Optional[int] = None, images: Optional[dict[int, str]] = None) -> dict[int, dict]:
+    """Ask the text model to re-judge finalists. Returns {index: verdict}; missing indexes were not judged.
+
+    A title counts as supported only if every claim the critic listed is literally true; a claim
+    list with a false entry overrides a careless ``title_supported: true``.
+
+    With frames attached, each clip is judged in its own call (``batch_size`` 1): in testing, a batch of
+    clips made gemma4:12b mark whole batches all-yes or all-no; one at a time its checks were
+    consistent. Text-only judging keeps batches of 6 so the clips are compared side by side.
+    """
     verdicts: dict[int, dict] = {}
+    if batch_size is None:
+        batch_size = 1 if images else 6
     for offset in range(0, len(items), batch_size):
         batch = items[offset:offset + batch_size]
         try:
-            data = ollama_json(url, model, critic_prompt(batch, game_profile, creator), CRITIC_SCHEMA,
-                               temperature=0.1, num_ctx=16384, num_predict=1600, timeout=900)
+            sheets = [images.get(item["index"]) for item in batch] if images else []
+            with_frames = bool(sheets) and all(sheets)
+            data = ollama_json(url, model, critic_prompt(batch, game_profile, creator, with_frames), CRITIC_SCHEMA,
+                               images=sheets if with_frames else None,
+                               temperature=0.0, num_ctx=16384, num_predict=2600, timeout=900)
         except Exception as exc:  # noqa: BLE001 - the critic is an extra filter, never a hard dependency
             if log:
                 log(f"Critic pass failed for {len(batch)} clip(s): {exc}")
@@ -714,14 +1158,59 @@ def critique(items: list[dict], *, url: str, model: str, game_profile: str = "Au
                 index = int(verdict.get("index", -1))
                 if index not in valid:
                     continue
+                claims = _claims(verdict.get("title_claims"))
+                supported = bool(verdict.get("title_supported", True)) and all(c["literally_true"] for c in claims)
                 verdicts[index] = {
-                    "stranger_score": max(0.0, min(100.0, float(verdict.get("stranger_score", 0)))),
+                    # Small local models are better at concrete yes/no checks than at free 0-100 scores,
+                    # so the score blends both: a clip needs a visible event or a clear reaction to rank.
+                    "stranger_score": round(0.5 * max(0.0, min(100.0, float(verdict.get("stranger_score", 0))))
+                                            + 0.5 * rubric_score(verdict), 1),
+                    "rubric": {k: bool(verdict.get(k, False)) for k in RUBRIC_WEIGHTS},
                     "keep": bool(verdict.get("keep", False)),
-                    "title_supported": bool(verdict.get("title_supported", True)),
+                    "title_supported": supported,
+                    "claims": claims,
                     "fixed_title": tidy_hook_title(verdict.get("fixed_title", "")),
+                    "frames_show": str(verdict.get("frames_show", "")).strip()[:400],
                     "what_happens": str(verdict.get("what_happens", "")).strip()[:200],
                     "reason": str(verdict.get("reason", "")).strip()[:200],
                 }
             except (TypeError, ValueError):
                 continue
     return verdicts
+
+
+def verify_titles(items: list[dict], *, url: str, model: str, creator: str = "",
+                  log: Optional[Callable[[str], None]] = None,
+                  images: Optional[dict[int, str]] = None) -> dict[int, dict]:
+    """Claim-by-claim fact-check of titles. ``items`` hold index, title, evidence and check_words.
+
+    Returns {index: {"title", "claims", "ok"}} where ``ok`` means every claim was literally true and
+    ``title`` is the literal version. With frames attached each title is checked in its own call.
+    """
+    if not items:
+        return {}
+    groups = [[item] for item in items] if images else [items]
+    out: dict[int, dict] = {}
+    for group in groups:
+        sheets = [images.get(item["index"]) for item in group] if images else []
+        with_frames = bool(sheets) and all(sheets)
+        try:
+            data = ollama_json(url, model, verify_prompt(group, creator, with_frames), VERIFY_SCHEMA,
+                               images=sheets if with_frames else None,
+                               temperature=0.0, num_ctx=12288, num_predict=1800, timeout=600)
+        except Exception as exc:  # noqa: BLE001
+            if log:
+                log(f"Title fact-check failed: {exc}")
+            continue
+        valid = {item["index"] for item in group}
+        for row in data.get("titles", []) or []:
+            try:
+                index = int(row.get("index", -1))
+            except (TypeError, ValueError):
+                continue
+            if index not in valid:
+                continue
+            claims = _claims(row.get("claims"))
+            out[index] = {"title": tidy_hook_title(row.get("literal_title", "")), "claims": claims,
+                          "ok": bool(claims) and all(c["literally_true"] for c in claims)}
+    return out
